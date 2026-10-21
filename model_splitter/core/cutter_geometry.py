@@ -552,17 +552,19 @@ def resample_smooth_curve_2d(points_2d, num_samples=32):
         return [p0.lerp(p1, i / (num_samples - 1)) for i in range(num_samples)]
 
     # 2. Adaptive endpoint-preserving smoothing:
-    #    - For dense freehand drag strokes, apply strong multi-pass fairing to eliminate hand tremor/ripples.
-    #    - For sparse clicked control points, apply light smoothing to preserve intentional corners.
+    #    - For sparse clicked control points (<= 10), keep exact control points (0 smoothing passes)
+    #      so the spline passes directly through every clicked point without shifting!
+    #    - For dense freehand drag strokes (> 10 points), smoothly ramp fairing to eliminate hand tremor.
     smoothed = list(clean)
-    if len(smoothed) > 2:
-        smooth_iters = min(120, len(smoothed) * 2) if len(smoothed) > 6 else 2
+    if len(smoothed) > 10:
+        smooth_iters = min(120, (len(smoothed) - 10) * 3)
         for _ in range(smooth_iters):
             nxt = [smoothed[0]]
             for i in range(1, len(smoothed) - 1):
                 nxt.append(smoothed[i - 1] * 0.25 + smoothed[i] * 0.5 + smoothed[i + 1] * 0.25)
             nxt.append(smoothed[-1])
             smoothed = nxt
+
 
     # 3. Evaluate dense Catmull-Rom polyline
     ext = [smoothed[0] * 2.0 - smoothed[1]] + smoothed + [smoothed[-1] * 2.0 - smoothed[-2]]

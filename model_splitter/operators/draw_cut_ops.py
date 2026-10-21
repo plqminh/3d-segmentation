@@ -81,7 +81,19 @@ class MODEL_SPLITTER_OT_draw_cut_line(bpy.types.Operator):
         self.points_2d = []
         self.points_3d = []
         self.points_local = []
+        self.segment_paths_local = []
+        self.src_bvh_local = None
+        if self.mode == 'MANUAL' and self.source_obj and self.source_obj.data:
+            try:
+                from mathutils.bvhtree import BVHTree
+                verts_l = [v.co.copy() for v in self.source_obj.data.vertices]
+                polys_l = [tuple(p.vertices) for p in self.source_obj.data.polygons]
+                if verts_l and polys_l:
+                    self.src_bvh_local = BVHTree.FromPolygons(verts_l, polys_l)
+            except Exception:
+                self.src_bvh_local = None
         self.mouse_pos = Vector((event.mouse_region_x, event.mouse_region_y))
+
         self.press_pos = self.mouse_pos.copy()
         self.is_dragging = False
         self.is_rotating_model = False
@@ -114,7 +126,70 @@ class MODEL_SPLITTER_OT_draw_cut_line(bpy.types.Operator):
             return location
         return None
 
+    def _compute_surface_segment_local(self, pt_a, pt_b, steps=12):
+        """
+        Computes a smooth 3D surface-snapped path between `pt_a` and `pt_b` in `source_obj` local space
+        with endpoints strictly pinned at `pt_a` and `pt_b` so adding new points never shifts previous segments.
+        """
+        seg_len = (pt_b - pt_a).length
+        if seg_len < 1e-6:
+            return [pt_a.copy(), pt_b.copy()]
+
+        pts = [pt_a.lerp(pt_b, i / steps) for i in range(steps + 1)]
+        if self.src_bvh_local is not None:
+            for i in range(1, steps):
+                near_loc, _, _, dist = self.src_bvh_local.find_nearest(pts[i])
+                if near_loc is not None and dist < seg_len * 0.6:
+                    pts[i] = near_loc
+
+            for _ in range(2):
+                nxt = [pts[0]]
+                for i in range(1, steps):
+                    mid = pts[i - 1] * 0.25 + pts[i] * 0.5 + pts[i + 1] * 0.25
+                    near_loc, _, _, dist = self.src_bvh_local.find_nearest(mid)
+                    nxt.append(near_loc if (near_loc is not None and dist < seg_len * 0.6) else mid)
+                nxt.append(pts[-1])
+                pts = nxt
+
+        return pts
+
+    def _add_manual_point(self, hit_3d, pos_2d):
+        """Records a new 3D surface point and locks the segment from the previous point."""
+        pt_local = self.source_obj.matrix_world.inverted() @ hit_3d
+        if self.points_local:
+            seg = self._compute_surface_segment_local(self.points_local[-1], pt_local)
+            self.segment_paths_local.append(seg)
+        self.points_local.append(pt_local)
+        self.points_3d.append(hit_3d)
+        self.points_2d.append(pos_2d.copy())
+
+    def get_manual_path_2d(self, context, include_close=False):
+        """Projects the locked 3D surface segments to 2D viewport coordinates."""
+        region = context.region
+        rv3d = context.region_data
+        if not region or not rv3d or not self.source_obj or not self.segment_paths_local:
+            return []
+
+        mat_w = self.source_obj.matrix_world
+        coords_2d = []
+        for s_idx, seg in enumerate(self.segment_paths_local):
+            start_k = 0 if s_idx == 0 else 1
+            for pt_l in seg[start_k:]:
+                p2d = view3d_utils.location_3d_to_region_2d(region, rv3d, mat_w @ pt_l)
+                if p2d is not None:
+                    coords_2d.append((p2d.x, p2d.y))
+
+        if include_close and len(self.points_local) >= 3:
+            close_seg = self._compute_surface_segment_local(self.points_local[-1], self.points_local[0])
+            for pt_l in close_seg[1:]:
+                p2d = view3d_utils.location_3d_to_region_2d(region, rv3d, mat_w @ pt_l)
+                if p2d is not None:
+                    coords_2d.append((p2d.x, p2d.y))
+
+        return coords_2d
+
     def get_current_2d_points(self, context):
+
         """
         Returns the 2D screen coordinates for the active stroke.
         In MANUAL mode, dynamically re-projects the 3D surface-locked points so they
@@ -190,9 +265,7 @@ class MODEL_SPLITTER_OT_draw_cut_line(bpy.types.Operator):
                 if hit_3d is not None:
                     pt_local = self.source_obj.matrix_world.inverted() @ hit_3d
                     if not self.points_local or (pt_local - self.points_local[-1]).length > 0.02:
-                        self.points_local.append(pt_local)
-                        self.points_3d.append(hit_3d)
-                        self.points_2d.append(self.mouse_pos.copy())
+                        self._add_manual_point(hit_3d, self.mouse_pos)
             return {'RUNNING_MODAL'}
 
         # Left Mouse Button actions
@@ -213,15 +286,13 @@ class MODEL_SPLITTER_OT_draw_cut_line(bpy.types.Operator):
                 if self.mode == 'MANUAL':
                     hit_3d = self.raycast_surface_point(context, curr_pos.x, curr_pos.y)
                     if hit_3d is not None:
-                        pt_local = self.source_obj.matrix_world.inverted() @ hit_3d
-                        self.points_local.append(pt_local)
-                        self.points_3d.append(hit_3d)
-                        self.points_2d.append(curr_pos)
+                        self._add_manual_point(hit_3d, curr_pos)
                         self.is_dragging = True
                     else:
                         # Clicking & dragging on empty space in Manual mode orbits around the model!
                         self.is_rotating_model = True
                         self.rot_prev_mouse = curr_pos.copy()
+
                 else:
                     # STRAIGHT or CURVED screen-space modes
                     if not self.points_2d or (curr_pos - self.points_2d[-1]).length > 2.0:
@@ -281,7 +352,10 @@ class MODEL_SPLITTER_OT_draw_cut_line(bpy.types.Operator):
                     self.points_3d.pop()
                 if self.points_local:
                     self.points_local.pop()
+                if self.segment_paths_local:
+                    self.segment_paths_local.pop()
                 return {'RUNNING_MODAL'}
+
 
             # Confirm cut: Enter or Space
             if event.type in {'RET', 'NUMPAD_ENTER', 'SPACE'}:
@@ -430,7 +504,7 @@ class MODEL_SPLITTER_OT_draw_cut_line(bpy.types.Operator):
 
         active_pts = self.get_current_2d_points(context)
 
-        # Draw connecting line strip or smoothed Catmull-Rom curve
+        # Draw connecting line strip or locked 3D surface path
         if len(active_pts) >= 2:
             if self.mode == 'CURVED':
                 settings = getattr(context.scene, "model_splitter", None)
@@ -440,16 +514,13 @@ class MODEL_SPLITTER_OT_draw_cut_line(bpy.types.Operator):
                     preview_pts.append(self.mouse_pos)
                 smooth_pts = resample_smooth_curve_2d(preview_pts, num_samples=max(32, num_s * 2))
                 line_coords = [(p.x, p.y) for p in smooth_pts]
-            elif self.mode == 'MANUAL' and len(active_pts) >= 3:
-                if self.hover_close:
-                    pts_3d_preview = [Vector((p.x, p.y, 0.0)) for p in active_pts]
-                    closed_pts = resample_closed_curve_3d(pts_3d_preview, num_samples=48, smooth_passes=2)
-                    line_coords = [(p.x, p.y) for p in closed_pts] + [(closed_pts[0].x, closed_pts[0].y)]
-                else:
-                    smooth_pts = resample_smooth_curve_2d(active_pts, num_samples=max(24, len(active_pts) * 6))
-                    line_coords = [(p.x, p.y) for p in smooth_pts]
+            elif self.mode == 'MANUAL':
+                line_coords = self.get_manual_path_2d(context, include_close=self.hover_close)
+                if len(line_coords) < 2:
+                    line_coords = [(p.x, p.y) for p in active_pts]
             else:
                 line_coords = [(p.x, p.y) for p in active_pts]
+
 
             batch_line = batch_for_shader(shader, 'LINE_STRIP', {"pos": line_coords})
             shader.bind()
