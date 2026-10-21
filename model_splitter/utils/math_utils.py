@@ -30,30 +30,54 @@ def get_world_bounds(obj):
     return min_corner, max_corner, center, dimensions
 
 
-def get_scene_scale_to_mm(context):
+def get_scene_scale_to_mm(context, ref_obj=None):
     """
-    Determines multiplier to convert scene units to millimeters.
-    Blender default: 1 unit = 1 meter (1000 mm).
-    If unit system is METRIC with unit_scale = 0.001, then 1 unit = 1 mm.
+    Determines multiplier to convert Blender scene units to millimeters for 3D printing.
+    - If the user explicitly configured a custom Blender unit scale (e.g. 0.001 for mm), respects it.
+    - In Blender's default scene (scale_length == 1.0), automatically adapts to the model's coordinate scale:
+      * Millimeter-scale STL/OBJ models (max_dim >= 25 BU): 1 BU = 1 mm (scale_to_mm = 1.0)
+      * Centimeter-scale models (8 <= max_dim < 25 BU):     1 BU = 10 mm (scale_to_mm = 10.0)
+      * Standard Blender scale (max_dim < 8 BU, e.g. 2 BU): 2 BU = 100 mm print (scale_to_mm = 50.0)
     """
+    import bpy
     unit_settings = context.scene.unit_settings
-    if unit_settings.system == 'METRIC':
+    if unit_settings.system == 'METRIC' and abs(unit_settings.scale_length - 1.0) > 1e-4:
         return unit_settings.scale_length * 1000.0
-    return 1000.0
+
+    if ref_obj is None:
+        settings = getattr(context.scene, "model_splitter", None)
+        if settings and getattr(settings.cut, "active_source_name", ""):
+            ref_obj = bpy.data.objects.get(settings.cut.active_source_name)
+        if ref_obj is None:
+            ref_obj = getattr(context, "active_object", None)
+
+    if ref_obj is not None and getattr(ref_obj, "type", "") == 'MESH':
+        try:
+            _, _, _, dims = get_world_bounds(ref_obj)
+            max_dim = max(dims.x, dims.y, dims.z)
+            if max_dim >= 25.0:
+                return 1.0
+            elif max_dim >= 8.0:
+                return 10.0
+        except Exception:
+            pass
+
+    return 50.0
 
 
-def mm_to_scene_units(context, mm_value):
+def mm_to_scene_units(context, mm_value, ref_obj=None):
     """Converts a millimeter value to Blender internal scene units."""
-    scale_to_mm = get_scene_scale_to_mm(context)
+    scale_to_mm = get_scene_scale_to_mm(context, ref_obj=ref_obj)
     if scale_to_mm <= 0:
-        scale_to_mm = 1000.0
+        scale_to_mm = 50.0
     return mm_value / scale_to_mm
 
 
-def scene_units_to_mm(context, scene_value):
+def scene_units_to_mm(context, scene_value, ref_obj=None):
     """Converts a Blender internal scene value to millimeters."""
-    scale_to_mm = get_scene_scale_to_mm(context)
+    scale_to_mm = get_scene_scale_to_mm(context, ref_obj=ref_obj)
     return scene_value * scale_to_mm
+
 
 
 def rotation_align_vector(source_vec, target_vec):

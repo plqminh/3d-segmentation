@@ -185,10 +185,11 @@ from .cutter_geometry import (
 def _compute_cross_section_placements(cutter_obj, cut_plane_matrix, source_obj, count, pin_radius, fallback_bounds_radius):
     """
     Computes `count` (local_pos, local_norm) placements on the cutting surface strictly inside
-    the 3D cross-section where the cutter slices `source_obj`.
+    the 3D cross-section where the cutter slices `source_obj`, along with `max_wall`.
+    Returns (placements, max_wall).
     """
     if count <= 0:
-        return []
+        return [], 0.0
 
     surface_bvh, src_bvh, cross_pts, interior_samples, best_center, bounds_2d = compute_cut_cross_section(
         cutter_obj, cut_plane_matrix, source_obj
@@ -198,10 +199,13 @@ def _compute_cross_section_placements(cutter_obj, cut_plane_matrix, source_obj, 
         # Fallback if cutter does not currently intersect source_obj
         spread_radius = max(pin_radius * 3.0, min(fallback_bounds_radius * 0.45, fallback_bounds_radius - pin_radius * 2.0))
         offsets_2d = distribute_connectors_2d(count, spread_radius)
-        return [snap_local_xy_to_surface(surface_bvh, off.x, off.y) for off in offsets_2d]
+        return [snap_local_xy_to_surface(surface_bvh, off.x, off.y) for off in offsets_2d], 0.0
+
+    max_wall = max((s[2] for s in interior_samples), default=0.0)
+    eff_pin_r = min(pin_radius, max_wall * 0.35) if max_wall > 1e-5 else pin_radius
 
     if count == 1:
-        return [(best_center[0], best_center[1])]
+        return [(best_center[0], best_center[1])], max_wall
 
     min_x, max_x, min_y, max_y = bounds_2d
     span_x = max_x - min_x
@@ -210,8 +214,8 @@ def _compute_cross_section_placements(cutter_obj, cut_plane_matrix, source_obj, 
     cy = best_center[0].y
 
     # Safe half-extents inside the actual cut cross-section
-    rx = max(pin_radius * 1.15, min(span_x * 0.32, (span_x * 0.5) - pin_radius * 1.35))
-    ry = max(pin_radius * 1.15, min(span_y * 0.32, (span_y * 0.5) - pin_radius * 1.35))
+    rx = max(eff_pin_r * 1.15, min(span_x * 0.32, (span_x * 0.5) - eff_pin_r * 1.35))
+    ry = max(eff_pin_r * 1.15, min(span_y * 0.32, (span_y * 0.5) - eff_pin_r * 1.35))
 
     # Build symmetric candidate 2D positions tailored to the cross-section aspect ratio
     sym_2d = []
@@ -221,7 +225,7 @@ def _compute_cross_section_placements(cutter_obj, cut_plane_matrix, source_obj, 
         else:
             sym_2d = [(cx, cy - ry), (cx, cy + ry)]
     elif count == 3:
-        if min(span_x, span_y) < pin_radius * 4.5:
+        if min(span_x, span_y) < eff_pin_r * 4.5:
             # Narrow cross-section: distribute colinearly along the longer axis
             if span_x >= span_y:
                 sym_2d = [(cx - rx, cy), (cx, cy), (cx + rx, cy)]
@@ -248,8 +252,7 @@ def _compute_cross_section_placements(cutter_obj, cut_plane_matrix, source_obj, 
         ][:count]
 
     # Verify whether all symmetric candidates lie deep enough inside the solid cross-section
-    max_wall = max((s[2] for s in interior_samples), default=0.0)
-    min_req_wall = min(max_wall * 0.65, max(pin_radius * 1.2, max_wall * 0.28))
+    min_req_wall = min(max_wall * 0.65, max(eff_pin_r * 1.1, max_wall * 0.28))
 
     valid_sym = []
     for sx, sy in sym_2d:
@@ -271,9 +274,8 @@ def _compute_cross_section_placements(cutter_obj, cut_plane_matrix, source_obj, 
             if w_d >= min_req_wall:
                 valid_sym.append((loc_3d, norm_3d))
 
-
     if len(valid_sym) == count:
-        return valid_sym
+        return valid_sym, max_wall
 
     # Fallback for concave / multi-island / L-shaped cross-sections:
     # Farthest-point sampling among deep interior cross-section samples
@@ -296,7 +298,7 @@ def _compute_cross_section_placements(cutter_obj, cut_plane_matrix, source_obj, 
         else:
             break
 
-    return [(c[0], c[1]) for c in chosen]
+    return [(c[0], c[1]) for c in chosen], max_wall
 
 
 def generate_cut_connectors(
@@ -315,14 +317,25 @@ def generate_cut_connectors(
     settings = context.scene.model_splitter
     con_props = settings.connector
 
-    radius = mm_to_scene_units(context, con_props.diameter_mm * 0.5)
-    length = mm_to_scene_units(context, con_props.length_mm)
-    clearance = mm_to_scene_units(context, con_props.clearance_mm)
+    radius = mm_to_scene_units(context, con_props.diameter_mm * 0.5, ref_obj=source_obj)
+    length = mm_to_scene_units(context, con_props.length_mm, ref_obj=source_obj)
+    clearance = mm_to_scene_units(context, con_props.clearance_mm, ref_obj=source_obj)
 
     count = con_props.count
-    placements = _compute_cross_section_placements(
+    placements, max_wall = _compute_cross_section_placements(
         cutter_obj, cut_plane_matrix, source_obj, count, radius, bounds_radius
     )
+
+    # If the cut is across a narrow appendage (e.g. ear or finger), clamp pin size so it fits inside the cross-section wall
+    if max_wall > 1e-5:
+        max_safe_r = max_wall * (0.48 if count == 1 else 0.35)
+        max_safe_l = max_wall * 1.35
+        if radius > max_safe_r or length > max_safe_l:
+            clamp_scale = min(1.0, max_safe_r / max(radius, 1e-6), max_safe_l / max(length, 1e-6))
+            radius *= clamp_scale
+            length *= clamp_scale
+            clearance *= clamp_scale
+
 
     pins = []
     sockets = []
