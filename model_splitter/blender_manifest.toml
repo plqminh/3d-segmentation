@@ -1,0 +1,19 @@
+schema_version = "1.0.0"
+
+id = "model_splitter"
+version = "1.0.0"
+name = "ModelSplitter"
+tagline = "Split 3D models into printable parts with automatic pin/socket connectors"
+maintainer = "User"
+type = "add-on"
+
+blender_version_min = "4.2.0"
+
+license = ["SPDX:GPL-3.0-or-later"]
+
+[build]
+paths_exclude_pattern = [
+    "__pycache__/",
+    "*.pyc",
+    ".git/",
+]
