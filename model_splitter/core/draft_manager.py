@@ -13,7 +13,7 @@ from ..utils.mesh_utils import (
     separate_loose_parts,
 )
 from ..utils.math_utils import get_world_bounds, mm_to_scene_units
-from .cutter_geometry import setup_straight_cutter, setup_curved_cutter
+from .cutter_geometry import setup_straight_cutter, setup_curved_cutter, setup_base_cutter
 from .connectors import generate_cut_connectors
 from .boolean_ops import split_mesh_by_cutter_volume, apply_connectors_to_parts
 
@@ -59,8 +59,12 @@ def enter_draft_mode(context, source_obj, cut_type='STRAIGHT', existing_cutter=N
         _move_object_hierarchy_to_collection(cutter_obj, draft_col)
     elif cut_type == 'CURVED':
         cutter_obj = setup_curved_cutter(context, source_obj, target_collection=draft_col)
+    elif cut_type == 'SEPARATE_BASE':
+        cutter_obj, _ = setup_base_cutter(context, source_obj, target_collection=draft_col)
     else:
         cutter_obj, _ = setup_straight_cutter(context, source_obj, target_collection=draft_col)
+
+    cut_props.cut_type = cut_type if cut_type in ('STRAIGHT', 'CURVED', 'MANUAL', 'EXTRUDE_CURVE', 'POLYGONAL_LINE', 'POLYGONAL_CYLINDER', 'SEPARATE_BASE') else 'STRAIGHT'
 
     if custom_world_mat:
         cutter_obj.matrix_world = custom_world_mat
@@ -86,14 +90,31 @@ def swap_pin_target(context):
     update_draft_connectors(context)
 
 
-def update_draft_connectors(context):
+def _extract_draft_pin_xy_offsets(draft_col, cutter_mat_inv):
+    """Extracts 2D (x, y) local coordinates of existing draft preview pins in cutter space."""
+    if not draft_col:
+        return []
+    pin_objs = sorted(
+        [obj for obj in draft_col.objects if obj.name.startswith("MS_Conn_") and obj.name.endswith("_Pin")],
+        key=lambda o: o.name,
+    )
+    offsets = []
+    for pin in pin_objs:
+        local_pos = cutter_mat_inv @ pin.matrix_world.translation
+        offsets.append((local_pos.x, local_pos.y))
+    return offsets
+
+
+def update_draft_connectors(context, force_auto=False):
     """
     Regenerates connector preview objects in the draft collection to reflect
     changes in count, shape, diameter, and clearance.
+    Preserves custom pin positions when placement_mode == 'MANUAL' unless force_auto=True.
     """
     from mathutils import Matrix
     settings = context.scene.model_splitter
     cut_props = settings.cut
+    con_props = settings.connector
 
     if not cut_props.is_in_draft:
         return
@@ -110,6 +131,13 @@ def update_draft_connectors(context):
     except Exception:
         pass
 
+    cutter_mat = cutter_obj.matrix_world.copy()
+    cutter_mat_inv = cutter_mat.inverted()
+
+    manual_xy = None
+    if con_props.placement_mode == 'MANUAL' and not force_auto:
+        manual_xy = _extract_draft_pin_xy_offsets(draft_col, cutter_mat_inv)
+
     # Remove existing connector previews in draft collection
     for obj in list(draft_col.objects):
         if obj.name.startswith("MS_Conn_"):
@@ -117,8 +145,6 @@ def update_draft_connectors(context):
 
     _, _, _, dimensions = get_world_bounds(source_obj)
     bounds_radius = dimensions.length * 0.5
-    cutter_mat = cutter_obj.matrix_world.copy()
-    cutter_mat_inv = cutter_mat.inverted()
 
     # Generate preview pins and sockets snapped inside the actual cut cross-section
     pins, sockets = generate_cut_connectors(
@@ -128,26 +154,73 @@ def update_draft_connectors(context):
         target_collection=draft_col,
         cutter_obj=cutter_obj,
         source_obj=source_obj,
+        manual_xy_offsets=manual_xy,
     )
 
-    # Style preview connectors and parent in cutter local space without transform jump
-    for pin in pins:
+    # Style preview connectors and parent in cutter local space without transform jump.
+    # Parent each socket to its pin so moving a pin in MANUAL mode moves its socket wireframe automatically.
+    is_holes_only = bool(getattr(con_props, "holes_only", False))
+    for pin, socket in zip(pins, sockets):
         local_mat = cutter_mat_inv @ pin.matrix_world
-        pin.display_type = 'SOLID'
-        pin.color = (0.1, 0.9, 0.3, 0.8)  # Bright green for male pin
+        if is_holes_only:
+            pin.display_type = 'WIRE'
+            pin.color = (0.9, 0.2, 0.1, 0.6)  # Red wireframe marker when carving holes only
+        else:
+            pin.display_type = 'SOLID'
+            pin.color = (0.1, 0.9, 0.3, 0.8)  # Bright green for male pin / dowel
         pin.show_wire = True
         pin.parent = cutter_obj
         pin.matrix_parent_inverse = Matrix.Identity(4)
         pin.matrix_basis = local_mat
 
-    for socket in sockets:
-        local_mat = cutter_mat_inv @ socket.matrix_world
         socket.display_type = 'WIRE'
         socket.color = (0.9, 0.2, 0.1, 0.6)  # Red wireframe for female socket clearance
         socket.show_wire = True
-        socket.parent = cutter_obj
+        socket.hide_select = True
+        socket.parent = pin
         socket.matrix_parent_inverse = Matrix.Identity(4)
-        socket.matrix_basis = local_mat
+        socket.matrix_basis = Matrix.Identity(4)
+
+
+def update_draft_extrude_depth(context):
+    """
+    Dynamically updates the extrusion depth of an active `MS_Curve_Detail_Cutter` in Draft Mode
+    and refreshes the connector preview on its internal floor cap.
+    """
+    from mathutils import Matrix
+    settings = context.scene.model_splitter
+    cut_props = settings.cut
+    if not cut_props.is_in_draft:
+        return
+
+    cutter_obj = bpy.data.objects.get(cut_props.active_cutter_name)
+    source_obj = bpy.data.objects.get(cut_props.active_source_name)
+    if not cutter_obj or not source_obj or not cutter_obj.get("ms_is_extruded_detail", False):
+        return
+
+    old_depth = float(cutter_obj.get("ms_extrude_depth_scene", 0.1))
+    new_depth = max(1e-3, mm_to_scene_units(context, cut_props.extrude_depth_mm, ref_obj=source_obj))
+    dz = new_depth - old_depth
+    if abs(dz) < 1e-6:
+        return
+
+    # Shift cutter origin (internal floor cap Z=0) deeper along local -Z by dz,
+    # and raise top vertices (v.co.z > 1e-4) by +dz so the outer cap stays fixed in world space
+    cutter_obj.matrix_world = cutter_obj.matrix_world @ Matrix.Translation(Vector((0.0, 0.0, -dz)))
+    for v in cutter_obj.data.vertices:
+        if v.co.z > 1e-4:
+            v.co.z = max(1e-3, v.co.z + dz)
+    cutter_obj.data.update()
+
+    for child in cutter_obj.children:
+        if child.type == 'MESH' and child.data and "Extrude_Walls_Visual" in child.name:
+            for v in child.data.vertices:
+                if v.co.z > 1e-4:
+                    v.co.z = max(1e-3, v.co.z + dz)
+            child.data.update()
+
+    cutter_obj["ms_extrude_depth_scene"] = float(new_depth)
+    update_draft_connectors(context)
 
 
 def apply_draft_build(context):
@@ -174,11 +247,16 @@ def apply_draft_build(context):
 
     # Preserve cutter transformation
     cutter_matrix = cutter_obj.matrix_world.copy()
+    cutter_mat_inv = cutter_matrix.inverted()
     _, _, _, dimensions = get_world_bounds(source_obj)
     bounds_radius = dimensions.length * 0.5
 
-    # 1. Unlink draft preview connectors
+    # 1. Capture manual pin positions (if any) and unlink draft preview connectors
     draft_col = bpy.data.collections.get(DRAFT_COLLECTION_NAME)
+    manual_xy = None
+    if draft_col and con_props.placement_mode == 'MANUAL':
+        manual_xy = _extract_draft_pin_xy_offsets(draft_col, cutter_mat_inv)
+
     if draft_col:
         for obj in list(draft_col.objects):
             if obj.name.startswith("MS_Conn_"):
@@ -193,26 +271,32 @@ def apply_draft_build(context):
         target_collection=target_col,
         cutter_obj=cutter_obj,
         source_obj=source_obj,
+        manual_xy_offsets=manual_xy,
     )
 
     is_thin_blade = bool(cutter_obj.get("ms_is_thin_blade", False))
+    cut_gap = mm_to_scene_units(context, con_props.cut_gap_mm, ref_obj=source_obj)
 
     # 3. Perform solid volume cut (keep parts unified while applying connectors)
     parts_a, parts_b = split_mesh_by_cutter_volume(
         context,
         source_obj,
         cutter_obj,
-        split_islands=cut_props.split_islands if is_thin_blade else False
+        split_islands=cut_props.split_islands if is_thin_blade else False,
+        cut_gap=cut_gap,
     )
 
     # 4. Apply connectors (Pins & Sockets) to unified halves before island separation
+    is_holes_only = bool(getattr(con_props, "holes_only", False))
     apply_connectors_to_parts(
         context,
         parts_a,
         parts_b,
         pins,
         sockets,
-        target_side=con_props.target_side
+        target_side=con_props.target_side,
+        double_sided=con_props.double_sided,
+        holes_only=is_holes_only,
     )
 
     # 4b. Separate loose islands after pins/sockets have been cleanly attached/carved
@@ -221,6 +305,13 @@ def apply_draft_build(context):
         for pa in parts_a:
             if pa and pa.name in bpy.data.objects and len(pa.data.polygons) > 0:
                 islands = separate_loose_parts(context, pa)
+                if islands and len(islands) > 1:
+                    valid_a = [o for o in islands if len(o.data.polygons) >= 4]
+                    if valid_a:
+                        for o in islands:
+                            if len(o.data.polygons) < 4:
+                                bpy.data.objects.remove(o, do_unlink=True)
+                        islands = valid_a
                 final_a.extend(islands if islands else [pa])
         parts_a = final_a
 
@@ -228,14 +319,32 @@ def apply_draft_build(context):
         for pb in parts_b:
             if pb and pb.name in bpy.data.objects and len(pb.data.polygons) > 0:
                 islands = separate_loose_parts(context, pb)
+                if islands and len(islands) > 1:
+                    valid_b = [o for o in islands if len(o.data.polygons) >= 4]
+                    if valid_b:
+                        for o in islands:
+                            if len(o.data.polygons) < 4:
+                                bpy.data.objects.remove(o, do_unlink=True)
+                        islands = valid_b
                 final_b.extend(islands if islands else [pb])
         parts_b = final_b
 
 
-    # 5. Clean up helper solids (pins/sockets)
-    for p in pins:
-        if p and p.name in bpy.data.objects:
-            bpy.data.objects.remove(p, do_unlink=True)
+    # 5. Clean up helper solids (sockets, and pins unless double_sided loose dowels are requested)
+    dowel_objs = []
+    if con_props.double_sided and not is_holes_only and parts_a and parts_b:
+        for idx_p, p in enumerate(pins):
+            if p and p.name in bpy.data.objects:
+                p.name = f"{source_obj.name}_Dowel_{idx_p + 1}"
+                p.display_type = 'TEXTURED'
+                p.show_wire = False
+                p.color = (1.0, 1.0, 1.0, 1.0)
+                dowel_objs.append(p)
+    else:
+        for p in pins:
+            if p and p.name in bpy.data.objects:
+                bpy.data.objects.remove(p, do_unlink=True)
+
     for s in sockets:
         if s and s.name in bpy.data.objects:
             bpy.data.objects.remove(s, do_unlink=True)
@@ -251,15 +360,30 @@ def apply_draft_build(context):
     cut_props.active_cutter_name = ""
     cut_props.active_source_name = ""
 
-    all_results = parts_a + parts_b
+    all_results = parts_a + parts_b + dowel_objs
 
-    # Visual explode separation if requested
-    if cut_props.explode_distance_mm > 0.0 and parts_b:
-        normal = (cutter_matrix.to_3x3() @ Vector((0, 0, 1))).normalized()
-        offset = normal * mm_to_scene_units(context, cut_props.explode_distance_mm)
-        for p in parts_b:
-            if p and p.name in bpy.data.objects:
-                p.location += offset
+    # Tag resulting parts with base location and explode direction for live Explode Preview
+    normal = (cutter_matrix.to_3x3() @ Vector((0, 0, 1))).normalized()
+    offset = normal * mm_to_scene_units(context, cut_props.explode_distance_mm, ref_obj=source_obj)
+
+    for p in parts_a:
+        if p and p.name in bpy.data.objects:
+            p["ms_base_loc"] = tuple(p.location)
+            p["ms_explode_vec"] = (0.0, 0.0, 0.0)
+
+    for p in parts_b:
+        if p and p.name in bpy.data.objects:
+            p["ms_base_loc"] = tuple(p.location)
+            p["ms_explode_vec"] = tuple(normal)
+            if cut_props.explode_distance_mm > 0.0:
+                p.location = p.location + offset
+
+    for d in dowel_objs:
+        if d and d.name in bpy.data.objects:
+            d["ms_base_loc"] = tuple(d.location)
+            d["ms_explode_vec"] = tuple(normal * 0.5)
+            if cut_props.explode_distance_mm > 0.0:
+                d.location = d.location + offset * 0.5
 
     # Select all resulting parts
     bpy.ops.object.select_all(action='DESELECT')

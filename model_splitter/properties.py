@@ -38,6 +38,38 @@ def update_draft_preview(self, context):
             pass
 
 
+def update_extrude_depth(self, context):
+    """Dynamically updates the extruded curve cutter depth and pins in Draft Mode."""
+    settings = getattr(context.scene, "model_splitter", None)
+    if settings and settings.cut.is_in_draft:
+        try:
+            from .core.draft_manager import update_draft_extrude_depth
+            update_draft_extrude_depth(context)
+        except Exception:
+            pass
+
+
+def update_explode_preview(self, context):
+    """Dynamically updates the visual explode offset of split parts and draft sockets."""
+    from mathutils import Vector
+    from .utils.math_utils import mm_to_scene_units
+
+    settings = getattr(context.scene, "model_splitter", None)
+    if not settings:
+        return
+
+    dist_mm = settings.cut.explode_distance_mm
+    for obj in bpy.data.objects:
+        if obj.type == 'MESH' and "ms_base_loc" in obj and "ms_explode_vec" in obj:
+            try:
+                base_loc = Vector(obj["ms_base_loc"])
+                exp_vec = Vector(obj["ms_explode_vec"])
+                offset_len = mm_to_scene_units(context, dist_mm, ref_obj=obj)
+                obj.location = base_loc + exp_vec * offset_len
+            except Exception:
+                pass
+
+
 class ConnectorProperties(bpy.types.PropertyGroup):
     shape: EnumProperty(
         name="Pin Shape",
@@ -67,9 +99,9 @@ class ConnectorProperties(bpy.types.PropertyGroup):
 
     count: IntProperty(
         name="Connectors",
-        description="Number of alignment connectors (up to 5)",
+        description="Number of alignment connectors (0 for none, up to 5)",
         default=1,
-        min=1,
+        min=0,
         max=5,
         update=update_draft_preview,
     )
@@ -143,6 +175,20 @@ class ConnectorProperties(bpy.types.PropertyGroup):
         update=update_draft_preview,
     )
 
+    holes_only: BoolProperty(
+        name="Holes Only (No Pins)",
+        description="Carve alignment socket holes into both parts without generating male pins or dowels",
+        default=False,
+        update=update_draft_preview,
+    )
+
+    no_connectors: BoolProperty(
+        name="No Pins / Holes",
+        description="Cut only: do not create any pins, sockets, or holes",
+        default=False,
+        update=update_draft_preview,
+    )
+
     placement_mode: EnumProperty(
         name="Placement",
         description="How connectors are positioned on the cut plane",
@@ -158,6 +204,7 @@ class ConnectorProperties(bpy.types.PropertyGroup):
         name="Custom Pin Object",
         type=bpy.types.Object,
         description="Custom mesh used as connector profile",
+        update=update_draft_preview,
     )
 
 
@@ -169,6 +216,7 @@ class CutProperties(bpy.types.PropertyGroup):
             ('STRAIGHT', "Straight Cut", "Planar cutting plane that can be translated and rotated"),
             ('CURVED', "Curved Cut", "Organic curved cutting surface with contour control"),
             ('MANUAL', "Manual Cut", "Freehand polyline cut through the model"),
+            ('EXTRUDE_CURVE', "Curve Detail (Extrude)", "Extrude a closed curve into polygons to Boolean out a detail"),
             ('POLYGONAL_LINE', "Polygonal (Line)", "Carve out openings or inset details"),
             ('POLYGONAL_CYLINDER', "Polygonal (Cylinder)", "Isolate protruding parts like ears, horns, or limbs"),
             ('SEPARATE_BASE', "Separate from Base", "Detaches figurine feet/pedestal cleanly"),
@@ -215,8 +263,28 @@ class CutProperties(bpy.types.PropertyGroup):
             ('STRAIGHT', "Straight", "Draw a straight knife cut across the viewport"),
             ('CURVED', "Curved", "Draw a smooth curved arc cut across the viewport"),
             ('MANUAL', "Manual Surface", "Click or paint points directly on the 3D model surface"),
+            ('EXTRUDE_CURVE', "Curve Detail", "Draw a closed curve and extrude it to polygons to Boolean out a detail"),
         ],
         default='STRAIGHT',
+    )
+
+    curve_smoothness: FloatProperty(
+        name="Curve Smoothness",
+        description="0 = straight polygon edges exactly through your points, 1 = fully rounded spline (still passes through every point)",
+        default=0.0,
+        min=0.0,
+        max=1.0,
+        subtype='FACTOR',
+    )
+
+    extrude_depth_mm: FloatProperty(
+        name="Extrude Depth (mm)",
+        description="Depth (in mm) to extrude the closed curve into the model to Boolean out the detail",
+        default=10.0,
+        min=0.5,
+        max=500.0,
+        unit='NONE',
+        update=update_extrude_depth,
     )
 
     editable_points: IntProperty(
@@ -234,6 +302,7 @@ class CutProperties(bpy.types.PropertyGroup):
         min=0.0,
         max=150.0,
         unit='NONE',
+        update=update_explode_preview,
     )
 
     adaptive_surface: BoolProperty(

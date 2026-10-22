@@ -7,10 +7,11 @@ pin union, and socket subtraction.
 import math
 import bpy
 import bmesh
+from mathutils import Matrix, Vector
 from ..utils.mesh_utils import cleanup_mesh, separate_loose_parts, duplicate_object
 
 
-def apply_boolean_modifier(target_obj, tool_obj, operation='DIFFERENCE', solver='EXACT'):
+def apply_boolean_modifier(target_obj, tool_obj, operation='DIFFERENCE', solver='EXACT', adaptive_surface=None):
     """
     Applies a boolean operation between target_obj and tool_obj.
     Operation: 'DIFFERENCE', 'UNION', 'INTERSECT'
@@ -18,6 +19,10 @@ def apply_boolean_modifier(target_obj, tool_obj, operation='DIFFERENCE', solver=
     """
     if not target_obj or not tool_obj:
         return False
+
+    if adaptive_surface is None:
+        settings = getattr(bpy.context.scene, "model_splitter", None)
+        adaptive_surface = bool(settings.cut.adaptive_surface) if settings else False
 
     prev_active = bpy.context.view_layer.objects.active
     bpy.context.view_layer.objects.active = target_obj
@@ -29,7 +34,7 @@ def apply_boolean_modifier(target_obj, tool_obj, operation='DIFFERENCE', solver=
 
     try:
         bpy.ops.object.modifier_apply(modifier=mod.name)
-        cleanup_mesh(target_obj)
+        cleanup_mesh(target_obj, adaptive_surface=adaptive_surface)
         success = True
     except Exception as e:
         print(f"[ModelSplitter] Boolean {operation} failed: {e}")
@@ -88,7 +93,7 @@ def _delete_face_indices(obj, face_indices_to_delete):
     obj.data.update()
 
 
-def _split_mesh_by_thin_blade(context, source_obj, cutter_volume, target_col, split_islands=True):
+def _split_mesh_by_thin_blade(context, source_obj, cutter_volume, target_col, split_islands=True, cut_gap=0.0):
     """
     Slices source_obj using ONLY the wafer-thin cutting plane (no cylinder extrusion),
     then partitions the severed mesh islands across the cutting plane into Part A (-Z)
@@ -99,16 +104,39 @@ def _split_mesh_by_thin_blade(context, source_obj, cutter_volume, target_col, sp
     orig_comps = _find_face_components(source_obj.data)
     orig_sub_count = sum(1 for f_idx, _ in orig_comps if len(f_idx) >= min_sub_faces)
 
+    blade_r = max((math.hypot(v.co.x, v.co.y) for v in cutter_volume.data.vertices), default=1.0)
+    blade_t = float(cutter_volume.get("ms_blade_thickness", 1e-3))
+    eff_blade_t = max(blade_t, float(cut_gap))
+
+    saved_blade_coords = None
+    if eff_blade_t > blade_t + 1e-6:
+        saved_blade_coords = [v.co.copy() for v in cutter_volume.data.vertices]
+        extra_half_z = (eff_blade_t - blade_t) * 0.5
+        n_verts = len(cutter_volume.data.vertices)
+        num_ring = 64
+        for idx_v, v in enumerate(cutter_volume.data.vertices):
+            if n_verts == 8:
+                sign_z = -1.0 if idx_v < 4 else 1.0
+            elif idx_v < 2:
+                sign_z = -1.0 if idx_v == 0 else 1.0
+            else:
+                in_pair = (idx_v - 2) % (2 * num_ring)
+                sign_z = -1.0 if in_pair < num_ring else 1.0
+            v.co.z += sign_z * extra_half_z
+        cutter_volume.data.update()
+
     sliced_obj = duplicate_object(context, source_obj, name_suffix="_Sliced", target_collection=target_col)
     diff_ok = apply_boolean_modifier(sliced_obj, cutter_volume, operation='DIFFERENCE', solver='EXACT')
     if not diff_ok:
+        if saved_blade_coords is not None:
+            for v, co in zip(cutter_volume.data.vertices, saved_blade_coords):
+                v.co = co
+            cutter_volume.data.update()
         bpy.data.objects.remove(sliced_obj, do_unlink=True)
         return [], []
 
     components = _find_face_components(sliced_obj.data)
     sub_count = sum(1 for f_idx, _ in components if len(f_idx) >= min_sub_faces)
-    blade_r = max((math.hypot(v.co.x, v.co.y) for v in cutter_volume.data.vertices), default=1.0)
-    blade_t = float(cutter_volume.get("ms_blade_thickness", 1e-3))
 
     # If the contour was placed slightly inside the neck silhouette, progressively widen the outer rings in XY
     # (and flare outer rim thickness if a sparse chord missed a curved surface ridge)
@@ -170,8 +198,16 @@ def _split_mesh_by_thin_blade(context, source_obj, cutter_volume, target_col, sp
         cutter_volume.data.update()
 
         if not diff_ok or sliced_obj.name not in bpy.data.objects:
+            if saved_blade_coords is not None:
+                for v, co in zip(cutter_volume.data.vertices, saved_blade_coords):
+                    v.co = co
+                cutter_volume.data.update()
             return [], []
 
+    if saved_blade_coords is not None:
+        for v, co in zip(cutter_volume.data.vertices, saved_blade_coords):
+            v.co = co
+        cutter_volume.data.update()
 
     if sub_count <= orig_sub_count:
         # Mesh was not severed into new substantial islands
@@ -179,7 +215,7 @@ def _split_mesh_by_thin_blade(context, source_obj, cutter_volume, target_col, sp
         return [sliced_obj], []
 
     world_to_blade = cutter_volume.matrix_world.inverted() @ sliced_obj.matrix_world
-    blade_t = float(cutter_volume.get("ms_blade_thickness", 1e-3))
+    blade_t = eff_blade_t
 
     # Filter out tiny boolean grazing slivers (< min_sub_faces) created along curved triangle edges
     valid_components = [
@@ -269,34 +305,58 @@ def _split_mesh_by_thin_blade(context, source_obj, cutter_volume, target_col, sp
 
 
 
-def split_mesh_by_cutter_volume(context, source_obj, cutter_volume, split_islands=True):
+def split_mesh_by_cutter_volume(context, source_obj, cutter_volume, split_islands=True, cut_gap=0.0):
     """
     Splits source_obj into two solid halves using either a wafer-thin cutting plane
     (for Manual surface cuts) or a half-space cutter volume.
+    Applies cut_gap spacing if cut_gap > 0.0.
     Returns (part_a, part_b).
     """
     target_col = source_obj.users_collection[0] if source_obj.users_collection else context.collection
 
     if cutter_volume.get("ms_is_thin_blade", False):
         return _split_mesh_by_thin_blade(
-            context, source_obj, cutter_volume, target_col, split_islands=split_islands
+            context, source_obj, cutter_volume, target_col, split_islands=split_islands, cut_gap=cut_gap
         )
 
     # Create duplicates for Part A and Part B
     part_a = duplicate_object(context, source_obj, name_suffix="_Part_A", target_collection=target_col)
     part_b = duplicate_object(context, source_obj, name_suffix="_Part_B", target_collection=target_col)
 
-    # Execute Part A (DIFFERENCE)
-    diff_ok = apply_boolean_modifier(part_a, cutter_volume, operation='DIFFERENCE', solver='EXACT')
-    if not diff_ok:
-        bpy.data.objects.remove(part_a, do_unlink=True)
-        part_a = None
+    orig_mat = cutter_volume.matrix_world.copy()
+    half_gap = float(cut_gap) * 0.5
 
-    # Execute Part B (INTERSECT)
-    inter_ok = apply_boolean_modifier(part_b, cutter_volume, operation='INTERSECT', solver='EXACT')
-    if not inter_ok:
-        bpy.data.objects.remove(part_b, do_unlink=True)
-        part_b = None
+    try:
+        # Execute Part A (DIFFERENCE: keeps local Z < -half_gap)
+        if half_gap > 1e-6:
+            cutter_volume.matrix_world = orig_mat @ Matrix.Translation(Vector((0.0, 0.0, -half_gap)))
+            try:
+                context.view_layer.update()
+            except Exception:
+                pass
+        diff_ok = apply_boolean_modifier(part_a, cutter_volume, operation='DIFFERENCE', solver='EXACT')
+        if not diff_ok:
+            bpy.data.objects.remove(part_a, do_unlink=True)
+            part_a = None
+
+        # Execute Part B (INTERSECT: keeps local Z > +half_gap)
+        if half_gap > 1e-6:
+            cutter_volume.matrix_world = orig_mat @ Matrix.Translation(Vector((0.0, 0.0, half_gap)))
+            try:
+                context.view_layer.update()
+            except Exception:
+                pass
+        inter_ok = apply_boolean_modifier(part_b, cutter_volume, operation='INTERSECT', solver='EXACT')
+        if not inter_ok:
+            bpy.data.objects.remove(part_b, do_unlink=True)
+            part_b = None
+    finally:
+        if half_gap > 1e-6:
+            cutter_volume.matrix_world = orig_mat
+            try:
+                context.view_layer.update()
+            except Exception:
+                pass
 
     results_a = [part_a] if part_a else []
     results_b = [part_b] if part_b else []
@@ -315,13 +375,31 @@ def split_mesh_by_cutter_volume(context, source_obj, cutter_volume, split_island
     return results_a, results_b
 
 
-def apply_connectors_to_parts(context, part_a_list, part_b_list, pins, sockets, target_side='PART_A'):
+def apply_connectors_to_parts(
+    context,
+    part_a_list,
+    part_b_list,
+    pins,
+    sockets,
+    target_side='PART_A',
+    double_sided=False,
+    holes_only=False,
+):
     """
     Unions pins into the male part(s), and carves sockets (with clearance) out of the female part(s).
-    target_side: 'PART_A' means pins attached to Part A, sockets subtracted from Part B.
-                 'PART_B' means pins attached to Part B, sockets subtracted from Part A.
+    When double_sided=True or holes_only=True, carves sockets out of BOTH Part A and Part B
+    without unioning male pins into either part.
     """
-    if not pins or not sockets:
+    if not sockets or (not pins and not (double_sided or holes_only)):
+        return
+
+    if double_sided or holes_only:
+        for obj in list(part_a_list) + list(part_b_list):
+            if not obj or obj.name not in bpy.data.objects:
+                continue
+            for socket in sockets:
+                if socket and socket.name in bpy.data.objects:
+                    apply_boolean_modifier(obj, socket, operation='DIFFERENCE', solver='EXACT')
         return
 
     male_list = part_a_list if target_side == 'PART_A' else part_b_list

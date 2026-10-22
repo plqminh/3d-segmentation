@@ -5,17 +5,28 @@ Exports separated parts as 3D print ready files for slicing software.
 
 import os
 import bpy
+from mathutils import Vector
 
 
 class MODEL_SPLITTER_OT_batch_export(bpy.types.Operator):
     bl_idname = "modelsplitter.batch_export"
     bl_label = "Batch Export Parts"
-    bl_description = "Exports all selected split parts into individual STL/OBJ files"
+    bl_description = "Exports split parts into individual STL/OBJ files"
     bl_options = {'REGISTER'}
 
     @classmethod
     def poll(cls, context):
-        return any(obj.type == 'MESH' for obj in context.selected_objects)
+        if any(obj.type == 'MESH' for obj in context.selected_objects):
+            return True
+        if context.active_object and context.active_object.type == 'MESH':
+            return True
+        settings = getattr(context.scene, "model_splitter", None)
+        if settings and settings.export.batch_export:
+            return any(
+                obj.type == 'MESH' and not obj.hide_viewport and ("_Part_" in obj.name or "_Dowel_" in obj.name)
+                for obj in bpy.data.objects
+            )
+        return False
 
     def execute(self, context):
         settings = context.scene.model_splitter.export
@@ -28,25 +39,50 @@ class MODEL_SPLITTER_OT_batch_export(bpy.types.Operator):
                 self.report({'ERROR'}, f"Cannot create export directory: {e}")
                 return {'CANCELLED'}
 
-        selected_meshes = [obj for obj in context.selected_objects if obj.type == 'MESH']
-        if not selected_meshes:
-            self.report({'WARNING'}, "No mesh objects selected for export.")
+        if settings.batch_export:
+            target_meshes = [obj for obj in context.selected_objects if obj.type == 'MESH']
+            if not target_meshes:
+                target_meshes = [
+                    obj for obj in bpy.data.objects
+                    if obj.type == 'MESH' and not obj.hide_viewport and ("_Part_" in obj.name or "_Dowel_" in obj.name)
+                ]
+        else:
+            active_obj = context.active_object
+            target_meshes = [active_obj] if (active_obj and active_obj.type == 'MESH') else []
+
+        if not target_meshes:
+            self.report({'WARNING'}, "No mesh objects found for export.")
             return {'CANCELLED'}
 
         exported_count = 0
         fmt = settings.format
+        raw_prefix = (settings.name_prefix or "").strip()
+        clean_prefix = bpy.path.clean_name(raw_prefix) if raw_prefix else ""
 
         prev_active = context.view_layer.objects.active
         prev_selection = list(context.selected_objects)
 
-        for obj in selected_meshes:
+        for obj in target_meshes:
             # Isolate selection for single part export
             bpy.ops.object.select_all(action='DESELECT')
             obj.select_set(True)
             context.view_layer.objects.active = obj
 
+            # Temporarily snap back to un-exploded base position if Explode Preview is active
+            saved_loc = None
+            if "ms_base_loc" in obj:
+                try:
+                    saved_loc = obj.location.copy()
+                    obj.location = Vector(obj["ms_base_loc"])
+                except Exception:
+                    saved_loc = None
+
             safe_name = bpy.path.clean_name(obj.name)
-            filename = f"{safe_name}.{fmt.lower()}"
+            if clean_prefix and clean_prefix != "Part" and not safe_name.startswith(clean_prefix):
+                out_stem = f"{clean_prefix}_{safe_name}"
+            else:
+                out_stem = safe_name
+            filename = f"{out_stem}.{fmt.lower()}"
             filepath = os.path.join(export_dir, filename)
 
             try:
@@ -64,6 +100,9 @@ class MODEL_SPLITTER_OT_batch_export(bpy.types.Operator):
                 exported_count += 1
             except Exception as e:
                 print(f"[ModelSplitter] Export error for {obj.name}: {e}")
+            finally:
+                if saved_loc is not None:
+                    obj.location = saved_loc
 
         # Restore original selection
         bpy.ops.object.select_all(action='DESELECT')

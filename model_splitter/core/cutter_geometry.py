@@ -10,7 +10,7 @@ import bmesh
 from mathutils import Vector, Matrix
 from mathutils.bvhtree import BVHTree
 from bpy_extras import view3d_utils
-from ..utils.math_utils import get_world_bounds, rotation_align_vector
+from ..utils.math_utils import get_world_bounds, rotation_align_vector, mm_to_scene_units
 
 
 def create_half_space_box(width, depth, height):
@@ -235,6 +235,8 @@ def compute_cut_cross_section(cutter_obj, cut_plane_matrix, source_obj):
     except Exception:
         src_bvh = None
 
+    is_extruded_detail = bool(cutter_obj.get("ms_is_extruded_detail", False))
+
     # Intersect source_obj edges with the cutting surface
     cross_pts = []
     for e in source_obj.data.edges:
@@ -252,6 +254,13 @@ def compute_cut_cross_section(cutter_obj, cut_plane_matrix, source_obj):
             loc, _, _, _ = surface_bvh.ray_cast(p1, -ray_dir, seg_len)
         if loc is not None:
             cross_pts.append(loc)
+
+    if is_extruded_detail or len(cross_pts) < 3:
+        inside_vis = [v.co.copy() for v in vis_verts if is_point_inside_bvh(src_bvh, v.co)]
+        if len(inside_vis) >= 3:
+            cross_pts.extend(inside_vis)
+        elif is_extruded_detail and len(vis_verts) >= 3:
+            cross_pts.extend([v.co.copy() for v in vis_verts])
 
     if len(cross_pts) < 3:
         return surface_bvh, src_bvh, cross_pts, [], None, None
@@ -282,13 +291,23 @@ def compute_cut_cross_section(cutter_obj, cut_plane_matrix, source_obj):
             gy = min_y + v * span_y
             candidates_2d.append((gx, gy))
 
+    vis_ring_2d = [(v.co.x, v.co.y) for v in vis_verts] if is_extruded_detail and len(vis_verts) >= 3 else []
+    n_vis_ring = len(vis_ring_2d)
+
     interior_samples = []
     for gx, gy in candidates_2d:
+        if is_extruded_detail:
+            hit_l, _, _, _ = surface_bvh.ray_cast(Vector((gx, gy, 500.0)), Vector((0.0, 0.0, -1.0)), 1000.0)
+            if hit_l is None:
+                hit_l, _, _, _ = surface_bvh.ray_cast(Vector((gx, gy, -500.0)), Vector((0.0, 0.0, 1.0)), 1000.0)
+            if hit_l is None:
+                continue
+
         loc_3d, norm_3d = snap_local_xy_to_surface(surface_bvh, gx, gy)
-        if is_point_inside_bvh(src_bvh, loc_3d):
+        if is_point_inside_bvh(src_bvh, loc_3d) or is_extruded_detail:
             _, _, _, wall_dist = src_bvh.find_nearest(loc_3d) if src_bvh else (None, None, None, 0.0)
             w_d = float(wall_dist or 0.0)
-            if src_bvh:
+            if src_bvh and not is_extruded_detail:
                 hp, np_h, _, dp = src_bvh.ray_cast(loc_3d, norm_3d, 10000.0)
                 hn, nn_h, _, dn = src_bvh.ray_cast(loc_3d, -norm_3d, 10000.0)
                 if hp is None or (np_h is not None and np_h.dot(norm_3d) <= 0.0):
@@ -299,6 +318,18 @@ def compute_cut_cross_section(cutter_obj, cut_plane_matrix, source_obj):
                     w_d = min(w_d, float(dp))
                 if dn is not None:
                     w_d = min(w_d, float(dn))
+            if n_vis_ring >= 3:
+                poly_d = 1e9
+                for ri in range(n_vis_ring):
+                    ax, ay = vis_ring_2d[ri]
+                    bx, by = vis_ring_2d[(ri + 1) % n_vis_ring]
+                    abx, aby = bx - ax, by - ay
+                    ab_l2 = abx * abx + aby * aby
+                    t_seg = max(0.0, min(1.0, ((gx - ax) * abx + (gy - ay) * aby) / ab_l2)) if ab_l2 > 1e-12 else 0.0
+                    d_seg = math.hypot(gx - (ax + t_seg * abx), gy - (ay + t_seg * aby))
+                    if d_seg < poly_d:
+                        poly_d = d_seg
+                w_d = poly_d if w_d <= 1e-6 else min(w_d, poly_d)
             interior_samples.append((loc_3d, norm_3d, w_d))
 
 
@@ -339,16 +370,16 @@ def recenter_cutter_to_mesh_intersection(cutter_obj, source_obj):
     if delta_local.length < 1e-6:
         return cutter_obj.matrix_world.translation.copy(), cutter_obj.matrix_world.copy()
 
-    # Counter-shift local vertices of cutter_obj and its visual plane child so world positions stay invariant
+    # Counter-shift local vertices of cutter_obj and all its visual child meshes so world positions stay invariant
     for v in cutter_obj.data.vertices:
         v.co -= delta_local
     cutter_obj.data.update()
 
-    vis_obj = get_cutter_visual_surface_obj(cutter_obj)
-    if vis_obj and vis_obj.data:
-        for v in vis_obj.data.vertices:
-            v.co -= delta_local
-        vis_obj.data.update()
+    for child in cutter_obj.children:
+        if child.type == 'MESH' and child.data:
+            for v in child.data.vertices:
+                v.co -= delta_local
+            child.data.update()
 
     world_mat = cutter_obj.matrix_world.copy()
     world_mat.translation = world_mat @ delta_local
@@ -388,6 +419,86 @@ def setup_straight_cutter(context, source_obj, target_collection=None):
         cutter_obj, bm_plane, col, name="MS_Cut_Plane_Visual", color=(0.2, 0.7, 1.0, 0.35)
     )
 
+    return cutter_obj, plane_obj
+
+
+def setup_base_cutter(context, source_obj, target_collection=None):
+    """
+    Auto-detects the pedestal / base transition height near the bottom of `source_obj`
+    and initializes a horizontal straight cutter right at the base seam.
+    Returns (cutter_volume_obj, visual_plane_obj).
+    """
+    col = target_collection or context.collection
+    min_corner, _, center, dimensions = get_world_bounds(source_obj)
+    diag = dimensions.length
+    size = max(diag * 1.5, 0.1)
+    height_z = max(dimensions.z, 1e-4)
+
+    # Default base cut height: 15% up from bottom Z
+    z_cut = min_corner.z + height_z * 0.15
+
+    # Analyze horizontal XY cross-section profile in the bottom 35% of the model using exact edge-plane intersections
+    if source_obj and source_obj.data and len(source_obj.data.edges) > 0:
+        mat_w = source_obj.matrix_world
+        verts_w = [mat_w @ v.co for v in source_obj.data.vertices]
+        edges = source_obj.data.edges
+        num_slices = 24
+        z_bottom = min_corner.z + height_z * 0.01
+        z_scan_top = min_corner.z + height_z * 0.35
+        slice_h = (z_scan_top - z_bottom) / max(1, num_slices - 1)
+
+        slice_radii = []
+        for s_idx in range(num_slices):
+            zh = z_bottom + s_idx * slice_h
+            cross_x = []
+            cross_y = []
+            for e in edges:
+                p0 = verts_w[e.vertices[0]]
+                p1 = verts_w[e.vertices[1]]
+                if (p0.z <= zh <= p1.z) or (p1.z <= zh <= p0.z):
+                    dz = p1.z - p0.z
+                    t = (zh - p0.z) / dz if abs(dz) > 1e-6 else 0.5
+                    cross_x.append(p0.x + (p1.x - p0.x) * t)
+                    cross_y.append(p0.y + (p1.y - p0.y) * t)
+            if len(cross_x) >= 2:
+                sx_span = max(cross_x) - min(cross_x)
+                sy_span = max(cross_y) - min(cross_y)
+                r_xy = 0.5 * math.hypot(sx_span, sy_span)
+            else:
+                r_xy = slice_radii[-1][1] if slice_radii else 0.0
+            slice_radii.append((zh, r_xy))
+
+        if len(slice_radii) >= 4:
+            # Find steepest inward step (largest drop in XY radius from slice i-1 to i)
+            best_drop = 0.0
+            best_z = z_cut
+            max_base_r = max((r for _, r in slice_radii[:8]), default=0.0)
+            for i in range(1, len(slice_radii)):
+                drop = slice_radii[i - 1][1] - slice_radii[i][1]
+                if drop > best_drop and drop > max_base_r * 0.12:
+                    best_drop = drop
+                    best_z = slice_radii[i][0]
+            if best_drop > 0.0:
+                z_cut = best_z
+
+    cut_origin = Vector((center.x, center.y, z_cut))
+    mesh_box = bpy.data.meshes.new("MS_Base_Cutter_Mesh")
+    bm_box = create_half_space_box(width=size, depth=size, height=size)
+    bm_box.to_mesh(mesh_box)
+    bm_box.free()
+
+    cutter_obj = bpy.data.objects.new("MS_Base_Cutter", mesh_box)
+    cutter_obj.matrix_world = Matrix.Translation(cut_origin)
+    cutter_obj.display_type = 'WIRE'
+    cutter_obj.show_in_front = True
+    col.objects.link(cutter_obj)
+
+    bm_plane = create_visual_plane_mesh(width=size, depth=size)
+    plane_obj = _attach_visual_surface(
+        cutter_obj, bm_plane, col, name="MS_Cut_Plane_Visual", color=(0.95, 0.55, 0.15, 0.4)
+    )
+
+    recenter_cutter_to_mesh_intersection(cutter_obj, source_obj)
     return cutter_obj, plane_obj
 
 
@@ -1208,3 +1319,354 @@ def create_cutter_from_surface_points(context, source_obj, points_3d, target_col
 
     centroid, world_mat = recenter_cutter_to_mesh_intersection(cutter_obj, source_obj)
     return cutter_obj, centroid, avg_normal, world_mat
+
+
+def create_extruded_curve_cutter_from_points(
+    context,
+    source_obj,
+    points_3d,
+    extrude_depth_mm=10.0,
+    target_collection=None,
+    view_normal=None,
+    smoothness=0.0,
+):
+    """
+    Creates a watertight, manifold 3D extruded polygonal Boolean cutter volume from a closed
+    3D curve contour on or near `source_obj`.
+    - Extrudes inward into the mesh by `extrude_depth_mm` to form a flat internal floor cap (at local Z = 0)
+      where alignment pins / holes are placed.
+    - Extrudes outward past the highest point of the detail relief so Boolean DIFFERENCE + INTERSECT
+      cleanly extracts the detail from the main body without cutting through the rest of the model.
+    Returns (cutter_obj, floor_center, out_normal, world_mat).
+    """
+    col = target_collection or context.collection
+    _, _, src_center, dimensions = get_world_bounds(source_obj)
+    diag = max(dimensions.length, 0.1)
+
+    if len(points_3d) < 3:
+        cutter_obj, _ = setup_straight_cutter(context, source_obj, target_collection=col)
+        return cutter_obj, src_center, Vector((0, 0, 1)), cutter_obj.matrix_world.copy()
+
+    centroid = sum(points_3d, Vector()) / len(points_3d)
+
+    # Build world-space BVHTree of source_obj to determine outward surface normal and relief height
+    src_bvh_w = None
+    if source_obj and source_obj.data and len(source_obj.data.polygons) > 0:
+        try:
+            src_mat = source_obj.matrix_world
+            src_verts_w = [src_mat @ v.co for v in source_obj.data.vertices]
+            src_polys = [tuple(p.vertices) for p in source_obj.data.polygons]
+            src_bvh_w = BVHTree.FromPolygons(src_verts_w, src_polys)
+        except Exception:
+            src_bvh_w = None
+
+    # 1. Compute outward extrusion normal (+Z points outward from main body through the detail)
+    mesh_norm_sum = Vector((0.0, 0.0, 0.0))
+    if src_bvh_w is not None:
+        for p in list(points_3d) + [centroid]:
+            _, near_norm, _, _ = src_bvh_w.find_nearest(p)
+            if near_norm is not None:
+                mesh_norm_sum += near_norm
+
+    newell_norm = Vector((0.0, 0.0, 0.0))
+    n_raw = len(points_3d)
+    rel_pts = [p - centroid for p in points_3d]
+    for i in range(n_raw):
+        curr = rel_pts[i]
+        nxt = rel_pts[(i + 1) % n_raw]
+        newell_norm.x += (curr.y - nxt.y) * (curr.z + nxt.z)
+        newell_norm.y += (curr.z - nxt.z) * (curr.x + nxt.x)
+        newell_norm.z += (curr.x - nxt.x) * (curr.y + nxt.y)
+
+    if mesh_norm_sum.length > 1e-5:
+        ref_out = mesh_norm_sum.normalized()
+    elif view_normal is not None and view_normal.length > 1e-5:
+        ref_out = (-view_normal).normalized()
+    elif (centroid - src_center).length > 1e-5:
+        ref_out = (centroid - src_center).normalized()
+    else:
+        ref_out = Vector((0.0, 0.0, 1.0))
+
+    if newell_norm.length > 1e-5:
+        n_poly = newell_norm.normalized()
+        if n_poly.dot(ref_out) < 0.0:
+            n_poly = -n_poly
+        out_normal = (ref_out * 0.65 + n_poly * 0.35).normalized()
+    else:
+        out_normal = ref_out
+
+    if out_normal.length < 1e-5:
+        out_normal = Vector((0.0, 0.0, 1.0))
+
+    x_hint = (points_3d[0] - centroid).normalized()
+    world_mat = build_orthonormal_cutter_matrix(centroid, x_hint, out_normal)
+    world_mat_inv = world_mat.inverted()
+
+    # 2. Densify the closed contour with STRAIGHT edges so every clicked / curve point stays exactly
+    #    where the user put it (no spline overshoot, corner rounding or shrinkage that could drift
+    #    outside the detail boundary), then snap intermediate points onto the mesh surface if close.
+    clean_pts = [points_3d[0].copy()]
+    for pt in points_3d[1:]:
+        if (pt - clean_pts[-1]).length > 1e-6:
+            clean_pts.append(pt.copy())
+    if len(clean_pts) > 2 and (clean_pts[-1] - clean_pts[0]).length <= 1e-6:
+        clean_pts.pop()
+    m_pts = len(clean_pts)
+    perimeter = sum((clean_pts[(i + 1) % m_pts] - clean_pts[i]).length for i in range(m_pts))
+    target_total = 160
+    smoothness = max(0.0, min(1.0, float(smoothness)))
+    seam_world = []
+    for i in range(m_pts):
+        a = clean_pts[i]
+        b = clean_pts[(i + 1) % m_pts]
+        seg_len = (b - a).length
+        n_sub = max(1, int(round(seg_len / max(perimeter, 1e-9) * target_total)))
+        if smoothness > 1e-4 and m_pts >= 3:
+            p0 = clean_pts[(i - 1) % m_pts]
+            p3 = clean_pts[(i + 2) % m_pts]
+        for s in range(n_sub):
+            t = s / n_sub
+            lin = a.lerp(b, t)
+            if smoothness > 1e-4 and m_pts >= 3:
+                # Catmull-Rom passes exactly through every control point; blend with the straight edge
+                seam_world.append(lin.lerp(_catmull_rom_point(p0, a, b, p3, t), smoothness))
+            else:
+                seam_world.append(lin)
+    if src_bvh_w is not None:
+        for i in range(len(seam_world)):
+            near_loc, _, _, dist = src_bvh_w.find_nearest(seam_world[i])
+            if near_loc is not None and dist < diag * 0.2:
+                seam_world[i] = near_loc
+
+    seam_local = [world_mat_inv @ p for p in seam_world]
+    num_ring = len(seam_local)
+
+    # 3. Extract 2D polygon in cutter XY plane and enforce counter-clockwise winding
+    poly_2d = [(lp.x, lp.y) for lp in seam_local]
+    signed_area = 0.0
+    for i in range(num_ring):
+        x0, y0 = poly_2d[i]
+        x1, y1 = poly_2d[(i + 1) % num_ring]
+        signed_area += (x0 * y1 - x1 * y0)
+    if signed_area < 0.0:
+        poly_2d.reverse()
+
+    # 4. Determine inward floor depth and outward relief clearance
+    min_surf_z = min(lp.z for lp in seam_local)
+    max_surf_z = max(lp.z for lp in seam_local)
+    peak_z = max_surf_z
+
+    if src_bvh_w is not None:
+        min_x = min(x for x, _ in poly_2d)
+        max_x = max(x for x, _ in poly_2d)
+        min_y = min(y for _, y in poly_2d)
+        max_y = max(y for _, y in poly_2d)
+        ray_dir_w = (-out_normal).normalized()
+        for u in (0.25, 0.5, 0.75):
+            gx = min_x + u * (max_x - min_x)
+            for v in (0.25, 0.5, 0.75):
+                gy = min_y + v * (max_y - min_y)
+                ray_start_w = world_mat @ Vector((gx, gy, max_surf_z + diag))
+                hit_w, _, _, _ = src_bvh_w.ray_cast(ray_start_w, ray_dir_w, diag * 2.0)
+                if hit_w is not None:
+                    hit_l = world_mat_inv @ hit_w
+                    if hit_l.z > peak_z:
+                        peak_z = hit_l.z
+
+    depth_scene = mm_to_scene_units(context, extrude_depth_mm, ref_obj=source_obj)
+    depth_scene = max(1e-3, min(depth_scene, diag * 0.9))
+
+    z_floor = min_surf_z - depth_scene
+    z_top = max(max_surf_z, peak_z) + max(depth_scene * 0.4, diag * 0.08, 0.04)
+    prism_height = max(z_top - z_floor, depth_scene + 0.02)
+
+    # Shift world_mat along local +Z so the internal floor cap lies at local Z = 0.0
+    world_mat.translation = world_mat @ Vector((0.0, 0.0, z_floor))
+
+    # 5. Build watertight extruded polygonal mesh (bm), floor cap visual (bm_vis), and extruded walls visual (bm_walls)
+    bm = bmesh.new()
+    bm_vis = bmesh.new()
+    bm_walls = bmesh.new()
+
+    bot_verts = [bm.verts.new(Vector((x, y, 0.0))) for x, y in poly_2d]
+    top_verts = [bm.verts.new(Vector((x, y, prism_height))) for x, y in poly_2d]
+    vis_verts = [bm_vis.verts.new(Vector((x, y, 0.0))) for x, y in poly_2d]
+    w_bot_verts = [bm_walls.verts.new(Vector((x, y, 0.0))) for x, y in poly_2d]
+    w_top_verts = [bm_walls.verts.new(Vector((x, y, prism_height))) for x, y in poly_2d]
+
+    for i in range(num_ring):
+        next_i = (i + 1) % num_ring
+        f_side = bm.faces.new([bot_verts[i], bot_verts[next_i], top_verts[next_i], top_verts[i]])
+        f_side.smooth = True
+        f_w = bm_walls.faces.new([w_bot_verts[i], w_bot_verts[next_i], w_top_verts[next_i], w_top_verts[i]])
+        f_w.smooth = True
+
+    f_bot = bm.faces.new(list(reversed(bot_verts)))
+    f_top = bm.faces.new(top_verts)
+    bmesh.ops.triangulate(bm, faces=[f_bot, f_top], quad_method='BEAUTY', ngon_method='EAR_CLIP')
+    bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
+
+    f_vis = bm_vis.faces.new(vis_verts)
+    bmesh.ops.triangulate(bm_vis, faces=[f_vis], quad_method='BEAUTY', ngon_method='EAR_CLIP')
+    bmesh.ops.recalc_face_normals(bm_vis, faces=bm_vis.faces)
+
+    mesh_cutter = bpy.data.meshes.new("MS_Curve_Detail_Cutter_Mesh")
+    bm.to_mesh(mesh_cutter)
+    bm.free()
+
+    cutter_obj = bpy.data.objects.new("MS_Curve_Detail_Cutter", mesh_cutter)
+    cutter_obj.matrix_world = world_mat
+    cutter_obj.display_type = 'WIRE'
+    cutter_obj.show_in_front = True
+    cutter_obj["ms_is_extruded_detail"] = True
+    cutter_obj["ms_extrude_depth_scene"] = float(depth_scene)
+    col.objects.link(cutter_obj)
+
+    _attach_visual_surface(
+        cutter_obj, bm_vis, col, name="MS_Cut_Plane_Visual", color=(0.1, 0.85, 0.35, 0.45)
+    )
+    _attach_visual_surface(
+        cutter_obj, bm_walls, col, name="MS_Extrude_Walls_Visual", color=(0.15, 0.75, 1.0, 0.28)
+    )
+
+    floor_center, world_mat = recenter_cutter_to_mesh_intersection(cutter_obj, source_obj)
+    return cutter_obj, floor_center, out_normal, world_mat
+
+
+def extract_points_from_curve_object(context, curve_obj, source_obj=None):
+    """
+    Samples a Blender CURVE object (Bezier, NURBS, or Poly, including Shrinkwrap or other modifiers)
+    into an ordered list of 3D world-space loop points.
+    """
+    if not curve_obj or curve_obj.type != 'CURVE' or not curve_obj.data:
+        return []
+
+    curve_data = curve_obj.data
+    orig_bevel = curve_data.bevel_depth
+    orig_extrude = curve_data.extrude
+    pts_3d = []
+
+    try:
+        curve_data.bevel_depth = 0.0
+        curve_data.extrude = 0.0
+        depsgraph = context.evaluated_depsgraph_get()
+        eval_obj = curve_obj.evaluated_get(depsgraph)
+        temp_mesh = eval_obj.to_mesh()
+        if temp_mesh and len(temp_mesh.vertices) >= 3:
+            mat_w = eval_obj.matrix_world
+            pts_3d = [mat_w @ v.co for v in temp_mesh.vertices]
+        eval_obj.to_mesh_clear()
+    except Exception:
+        pts_3d = []
+    finally:
+        curve_data.bevel_depth = orig_bevel
+        curve_data.extrude = orig_extrude
+
+    if len(pts_3d) < 3 and curve_data.splines:
+        mat_w = curve_obj.matrix_world
+        spline = curve_data.splines[0]
+        if spline.type == 'BEZIER':
+            pts_3d = [mat_w @ bp.co for bp in spline.bezier_points]
+        else:
+            pts_3d = [mat_w @ Vector((p.co.x, p.co.y, p.co.z)) for p in spline.points]
+
+    if source_obj and source_obj.data and len(pts_3d) >= 3:
+        try:
+            src_mat = source_obj.matrix_world
+            src_verts_w = [src_mat @ v.co for v in source_obj.data.vertices]
+            src_polys = [tuple(p.vertices) for p in source_obj.data.polygons]
+            src_bvh_w = BVHTree.FromPolygons(src_verts_w, src_polys)
+            snapped = []
+            for p in pts_3d:
+                near_loc, _, _, _ = src_bvh_w.find_nearest(p)
+                snapped.append(near_loc if near_loc is not None else p)
+            pts_3d = snapped
+        except Exception:
+            pass
+
+    return pts_3d
+
+
+def create_editable_detail_curve(context, source_obj, region=None, rv3d=None):
+    """
+    Spawns an interactive 3D cyclic Bezier curve (`MS_Detail_Curve`) snapped onto the front
+    surface of `source_obj` with a Shrinkwrap modifier so the user can shape the curve around
+    a detail before extruding it into a Boolean polygon cutter.
+    """
+    _, _, center, dimensions = get_world_bounds(source_obj)
+    diag = max(dimensions.length, 0.1)
+
+    view_dir = Vector((0.0, 1.0, 0.0))
+    if rv3d is not None:
+        try:
+            view_dir = (rv3d.view_rotation @ Vector((0.0, 0.0, -1.0))).normalized()
+        except Exception:
+            pass
+
+    out_dir = -view_dir
+    surface_origin = center + out_dir * (diag * 0.4)
+    surface_normal = out_dir.copy()
+
+    src_bvh_w = None
+    if source_obj and source_obj.data and len(source_obj.data.polygons) > 0:
+        try:
+            src_mat = source_obj.matrix_world
+            src_verts_w = [src_mat @ v.co for v in source_obj.data.vertices]
+            src_polys = [tuple(p.vertices) for p in source_obj.data.polygons]
+            src_bvh_w = BVHTree.FromPolygons(src_verts_w, src_polys)
+            ray_start = center + out_dir * (diag * 2.0)
+            hit_loc, hit_norm, _, _ = src_bvh_w.ray_cast(ray_start, view_dir, diag * 4.0)
+            if hit_loc is not None:
+                surface_origin = hit_loc
+                if hit_norm is not None and hit_norm.length > 1e-5:
+                    surface_normal = hit_norm.normalized()
+        except Exception:
+            pass
+
+    frame_mat = build_orthonormal_cutter_matrix(surface_origin, Vector((1.0, 0.0, 0.0)), surface_normal)
+    frame_inv = frame_mat.inverted()
+
+    curve_data = bpy.data.curves.new("MS_Detail_Curve_Data", type='CURVE')
+    curve_data.dimensions = '3D'
+    curve_data.resolution_u = 16
+    curve_data.bevel_depth = max(diag * 0.0035, 0.001)
+
+    spline = curve_data.splines.new('BEZIER')
+    spline.use_cyclic_u = True
+    num_ctrl = 8
+    spline.bezier_points.add(num_ctrl - 1)
+    radius = max(diag * 0.12, 0.04)
+
+    for i in range(num_ctrl):
+        ang = (2.0 * math.pi * i) / num_ctrl
+        local_pt = Vector((math.cos(ang) * radius, math.sin(ang) * radius, 0.0))
+        world_pt = frame_mat @ local_pt
+        if src_bvh_w is not None:
+            near_loc, _, _, _ = src_bvh_w.find_nearest(world_pt)
+            if near_loc is not None:
+                local_pt = frame_inv @ near_loc
+        bp = spline.bezier_points[i]
+        bp.co = local_pt
+        bp.handle_left_type = 'AUTO'
+        bp.handle_right_type = 'AUTO'
+
+    curve_obj = bpy.data.objects.new("MS_Detail_Curve", curve_data)
+    curve_obj.matrix_world = frame_mat
+    curve_obj.color = (0.1, 0.9, 1.0, 1.0)
+    curve_obj.show_in_front = True
+    curve_obj["ms_source_obj"] = source_obj.name
+
+    target_col = source_obj.users_collection[0] if source_obj.users_collection else context.collection
+    target_col.objects.link(curve_obj)
+
+    try:
+        sw_mod = curve_obj.modifiers.new(name="MS_Surface_Snap", type='SHRINKWRAP')
+        sw_mod.target = source_obj
+        sw_mod.wrap_method = 'NEAREST_SURFACEPOINT'
+        sw_mod.offset = curve_data.bevel_depth * 0.5
+        if hasattr(sw_mod, "use_apply_on_spline"):
+            sw_mod.use_apply_on_spline = True
+    except Exception:
+        pass
+
+    return curve_obj

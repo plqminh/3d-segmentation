@@ -61,10 +61,11 @@ def duplicate_object(context, obj, name_suffix="_copy", target_collection=None):
     return new_obj
 
 
-def cleanup_mesh(obj, merge_dist=0.0001):
+def cleanup_mesh(obj, merge_dist=0.0001, adaptive_surface=False):
     """
     Cleans up post-boolean geometry by merging duplicate vertices,
-    removing loose geometry, and recalculating normals outwards.
+    removing loose geometry, optionally optimizing boolean cap n-gons and degenerate slivers,
+    and recalculating normals outwards.
     """
     if not obj or obj.type != 'MESH':
         return
@@ -82,6 +83,19 @@ def cleanup_mesh(obj, merge_dist=0.0001):
     # Merge by distance to heal microscopic boolean cracks
     if merge_dist > 0.0:
         bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=merge_dist)
+
+    if adaptive_surface:
+        if merge_dist > 0.0 and bm.edges:
+            try:
+                bmesh.ops.dissolve_degenerate(bm, dist=merge_dist * 0.5, edges=list(bm.edges))
+            except Exception:
+                pass
+        ngon_faces = [f for f in bm.faces if len(f.verts) > 4]
+        if ngon_faces:
+            try:
+                bmesh.ops.triangulate(bm, faces=ngon_faces, quad_method='BEAUTY', ngon_method='BEAUTY')
+            except Exception:
+                pass
 
     # Recalculate normals to ensure consistent solid orientation
     bmesh.ops.recalc_face_normals(bm, faces=bm.faces)

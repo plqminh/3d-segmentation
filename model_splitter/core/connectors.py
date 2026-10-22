@@ -12,22 +12,29 @@ from mathutils.bvhtree import BVHTree
 from ..utils.math_utils import mm_to_scene_units, rotation_align_vector, distribute_connectors_2d
 
 
-def build_cylinder_mesh(radius, length, anchor_depth=0.0, taper_ratio=1.0, segments=32):
+def build_cylinder_mesh(radius, length, anchor_depth=0.0, taper_ratio=1.0, segments=32, double_sided=False):
     """
     Creates a cylinder or tapered frustum mesh in bmesh.
-    Root anchor extends into -Z (negative) by anchor_depth for solid boolean overlap.
-    Main shaft extends into +Z (positive) by length.
+    - Single-sided: Root anchor extends into -Z by anchor_depth; shaft extends into +Z by length.
+    - Double-sided: Symmetric dowel pin extending from -length to +length across Z=0.
     """
     bm = bmesh.new()
 
-    # Create top, middle (Z=0), and bottom rings
-    z_bottom = -anchor_depth
-    z_base = 0.0
-    z_top = length
-
     r_base = radius
     r_top = radius * taper_ratio
-    r_bottom = radius
+
+    if double_sided:
+        z_bottom = -length
+        z_base = 0.0
+        z_top = length
+        r_bottom = r_top
+    else:
+        z_bottom = -anchor_depth
+        z_base = 0.0
+        z_top = length
+        r_bottom = radius
+
+    has_bottom_ring = double_sided or (anchor_depth > 0.0)
 
     # Build circle vertices
     bottom_verts = []
@@ -39,13 +46,13 @@ def build_cylinder_mesh(radius, length, anchor_depth=0.0, taper_ratio=1.0, segme
         cos_t = math.cos(theta)
         sin_t = math.sin(theta)
 
-        if anchor_depth > 0.0:
+        if has_bottom_ring:
             bottom_verts.append(bm.verts.new(Vector((cos_t * r_bottom, sin_t * r_bottom, z_bottom))))
         base_verts.append(bm.verts.new(Vector((cos_t * r_base, sin_t * r_base, z_base))))
         top_verts.append(bm.verts.new(Vector((cos_t * r_top, sin_t * r_top, z_top))))
 
     # Connect side faces
-    if anchor_depth > 0.0:
+    if has_bottom_ring:
         for i in range(segments):
             next_i = (i + 1) % segments
             bm.faces.new([bottom_verts[i], bottom_verts[next_i], base_verts[next_i], base_verts[i]])
@@ -66,14 +73,14 @@ def build_cylinder_mesh(radius, length, anchor_depth=0.0, taper_ratio=1.0, segme
     return bm
 
 
-def build_rectangular_mesh(width, depth, length, anchor_depth=0.0):
+def build_rectangular_mesh(width, depth, length, anchor_depth=0.0, double_sided=False):
     """
-    Creates a rectangular key mesh with root anchor.
+    Creates a rectangular key mesh with root anchor or symmetric double-sided dowel length.
     """
     bm = bmesh.new()
     hw = width * 0.5
     hd = depth * 0.5
-    z_bottom = -anchor_depth
+    z_bottom = -length if double_sided else -anchor_depth
     z_top = length
 
     # 8 vertices of cuboid
@@ -102,12 +109,53 @@ def build_rectangular_mesh(width, depth, length, anchor_depth=0.0):
     return bm
 
 
+def build_custom_connector_mesh(custom_obj, radius, length, anchor_depth=0.0, clearance=0.0, double_sided=False):
+    """
+    Normalizes a user-supplied custom mesh to the target connector diameter, length,
+    anchor depth (or double-sided span), and radial/axial clearance.
+    """
+    bm = bmesh.new()
+    bm.from_mesh(custom_obj.data)
+    if not bm.verts:
+        bm.free()
+        return build_cylinder_mesh(radius + clearance, length + clearance, anchor_depth=anchor_depth, double_sided=double_sided)
+
+    xs = [v.co.x for v in bm.verts]
+    ys = [v.co.y for v in bm.verts]
+    zs = [v.co.z for v in bm.verts]
+    min_x, max_x = min(xs), max(xs)
+    min_y, max_y = min(ys), max(ys)
+    min_z, max_z = min(zs), max(zs)
+
+    cx = 0.5 * (min_x + max_x)
+    cy = 0.5 * (min_y + max_y)
+    span_xy = max(max_x - min_x, max_y - min_y, 1e-6)
+    span_z = max(max_z - min_z, 1e-6)
+
+    target_diam = (radius + clearance) * 2.0
+    scale_xy = target_diam / span_xy
+    z_bottom = -(length + clearance) if double_sided else -anchor_depth
+    z_top = length + clearance
+    target_z_span = max(z_top - z_bottom, 1e-6)
+
+    for v in bm.verts:
+        nx = (v.co.x - cx) * scale_xy
+        ny = (v.co.y - cy) * scale_xy
+        tz = (v.co.z - min_z) / span_z
+        nz = z_bottom + tz * target_z_span
+        v.co = Vector((nx, ny, nz))
+
+    bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
+    return bm
+
+
 def create_single_connector_pair(
     context,
     shape='CYLINDER',
     radius=0.0025,
     length=0.01,
     clearance=0.0002,
+    cut_gap=0.0,
     taper_angle_deg=5.0,
     double_sided=False,
     custom_obj=None,
@@ -116,7 +164,7 @@ def create_single_connector_pair(
 ):
     """
     Creates (pin_obj, socket_obj) pair in world space aligned along local Z axis.
-    pin_obj: Placed on male part with root anchor.
+    pin_obj: Placed on male part with root anchor (or symmetric loose dowel when double_sided=True).
     socket_obj: Dilated by clearance in radius and depth for zero-friction fit.
     """
     col = target_collection or context.collection
@@ -127,19 +175,24 @@ def create_single_connector_pair(
         taper_drop = math.tan(math.radians(taper_angle_deg)) * length
         taper_ratio = max(0.2, (radius - taper_drop) / radius)
 
-    anchor_depth = max(length * 0.35, radius * 0.6)  # Deep anchor into host mesh for clean union on curved surfaces
+    anchor_depth = max(length * 0.35, radius * 0.6) + cut_gap
 
     # --- 1. BUILD PIN OBJECT ---
     pin_mesh = bpy.data.meshes.new(f"{name_prefix}_Pin_Mesh")
     if shape in ('CYLINDER', 'CONICAL'):
-        bm_pin = build_cylinder_mesh(radius, length, anchor_depth=anchor_depth, taper_ratio=taper_ratio)
+        bm_pin = build_cylinder_mesh(
+            radius, length, anchor_depth=anchor_depth, taper_ratio=taper_ratio, double_sided=double_sided
+        )
     elif shape == 'RECTANGULAR':
-        bm_pin = build_rectangular_mesh(radius * 2, radius * 1.4, length, anchor_depth=anchor_depth)
-    elif shape == 'CUSTOM' and custom_obj:
-        bm_pin = bmesh.new()
-        bm_pin.from_mesh(custom_obj.data)
+        bm_pin = build_rectangular_mesh(
+            radius * 2, radius * 1.4, length, anchor_depth=anchor_depth, double_sided=double_sided
+        )
+    elif shape == 'CUSTOM' and custom_obj and custom_obj.type == 'MESH':
+        bm_pin = build_custom_connector_mesh(
+            custom_obj, radius, length, anchor_depth=anchor_depth, clearance=0.0, double_sided=double_sided
+        )
     else:
-        bm_pin = build_cylinder_mesh(radius, length, anchor_depth=anchor_depth)
+        bm_pin = build_cylinder_mesh(radius, length, anchor_depth=anchor_depth, double_sided=double_sided)
 
     bm_pin.to_mesh(pin_mesh)
     bm_pin.free()
@@ -150,20 +203,28 @@ def create_single_connector_pair(
     # --- 2. BUILD SOCKET OBJECT (DILATED BY CLEARANCE) ---
     socket_mesh = bpy.data.meshes.new(f"{name_prefix}_Socket_Mesh")
     s_radius = radius + clearance
-    s_length = length + clearance
-    # Sockets extend slightly behind Z=0 so curved cutting surfaces never leave a thin skin over the opening
-    s_anchor = max(clearance * 2.0, s_radius * 0.45)
+    s_length = length + clearance + cut_gap * 0.5
+    # Sockets extend slightly behind Z=0 so curved cutting surfaces or cut gaps never leave a skin over the opening
+    s_anchor = max(clearance * 2.0, s_radius * 0.45) + cut_gap
 
     if shape in ('CYLINDER', 'CONICAL'):
-        bm_socket = build_cylinder_mesh(s_radius, s_length, anchor_depth=s_anchor, taper_ratio=taper_ratio)
+        bm_socket = build_cylinder_mesh(
+            s_radius, s_length, anchor_depth=s_anchor, taper_ratio=taper_ratio, double_sided=double_sided
+        )
     elif shape == 'RECTANGULAR':
-        bm_socket = build_rectangular_mesh((radius * 2) + (clearance * 2), (radius * 1.4) + (clearance * 2), s_length, anchor_depth=s_anchor)
-    elif shape == 'CUSTOM' and custom_obj:
-        bm_socket = bmesh.new()
-        bm_socket.from_mesh(custom_obj.data)
-        bmesh.ops.scale(bm_socket, vec=Vector((1.0 + clearance, 1.0 + clearance, 1.0 + clearance)), verts=bm_socket.verts)
+        bm_socket = build_rectangular_mesh(
+            (radius * 2) + (clearance * 2),
+            (radius * 1.4) + (clearance * 2),
+            s_length,
+            anchor_depth=s_anchor,
+            double_sided=double_sided,
+        )
+    elif shape == 'CUSTOM' and custom_obj and custom_obj.type == 'MESH':
+        bm_socket = build_custom_connector_mesh(
+            custom_obj, radius, s_length, anchor_depth=s_anchor, clearance=clearance, double_sided=double_sided
+        )
     else:
-        bm_socket = build_cylinder_mesh(s_radius, s_length, anchor_depth=s_anchor)
+        bm_socket = build_cylinder_mesh(s_radius, s_length, anchor_depth=s_anchor, double_sided=double_sided)
 
     bm_socket.to_mesh(socket_mesh)
     bm_socket.free()
@@ -308,26 +369,43 @@ def generate_cut_connectors(
     target_collection=None,
     cutter_obj=None,
     source_obj=None,
+    manual_xy_offsets=None,
 ):
     """
     Generates all requested connectors (1-5) positioned strictly inside the 3D cut cross-section
-    and oriented perpendicular to the local cutting surface.
+    (or at user-adjusted manual positions) and oriented perpendicular to the local cutting surface.
     Returns (list_of_pin_objs, list_of_socket_objs).
     """
     settings = context.scene.model_splitter
     con_props = settings.connector
 
+    if getattr(con_props, "no_connectors", False):
+        return [], []
+
     radius = mm_to_scene_units(context, con_props.diameter_mm * 0.5, ref_obj=source_obj)
     length = mm_to_scene_units(context, con_props.length_mm, ref_obj=source_obj)
     clearance = mm_to_scene_units(context, con_props.clearance_mm, ref_obj=source_obj)
+    cut_gap = mm_to_scene_units(context, con_props.cut_gap_mm, ref_obj=source_obj)
 
     count = con_props.count
-    placements, max_wall = _compute_cross_section_placements(
+    auto_placements, max_wall = _compute_cross_section_placements(
         cutter_obj, cut_plane_matrix, source_obj, count, radius, bounds_radius
     )
 
+    if manual_xy_offsets:
+        surface_bvh = build_cutter_surface_bvh(cutter_obj) if cutter_obj else None
+        placements = []
+        for sx, sy in manual_xy_offsets[:count]:
+            loc_3d, norm_3d = snap_local_xy_to_surface(surface_bvh, sx, sy)
+            placements.append((loc_3d, norm_3d))
+        # If user increased count while in MANUAL mode, fill remaining slots from auto_placements
+        for extra in auto_placements[len(placements):count]:
+            placements.append(extra)
+    else:
+        placements = auto_placements
+
     # If the cut is across a narrow appendage (e.g. ear or finger), clamp pin size so it fits inside the cross-section wall
-    if max_wall > 1e-5:
+    if max_wall > 1e-5 and not manual_xy_offsets:
         max_safe_r = max_wall * (0.48 if count == 1 else 0.35)
         max_safe_l = max_wall * 1.35
         if radius > max_safe_r or length > max_safe_l:
@@ -348,7 +426,8 @@ def generate_cut_connectors(
     # - When target_side == 'PART_A' (male pin on Part A, socket in Part B), +Z already points from Part A into Part B!
     # - When target_side == 'PART_B' (male pin on Part B, socket in Part A), rotate 180 deg around local X (det = +1)
     #   so root is in +Z (Part B) and shaft points into -Z (Part A) without inverting face normals!
-    if con_props.target_side == 'PART_A':
+    use_double_span = bool(con_props.double_sided or getattr(con_props, "holes_only", False))
+    if con_props.target_side == 'PART_A' or use_double_span:
         flip_mat = Matrix.Identity(4)
     else:
         flip_mat = Matrix.Rotation(math.pi, 4, Vector((1.0, 0.0, 0.0)))
@@ -360,8 +439,9 @@ def generate_cut_connectors(
             radius=radius,
             length=length,
             clearance=clearance,
+            cut_gap=cut_gap,
             taper_angle_deg=con_props.taper_angle,
-            double_sided=con_props.double_sided,
+            double_sided=use_double_span,
             custom_obj=con_props.custom_object,
             target_collection=target_collection,
             name_prefix=f"MS_Conn_{i+1}"

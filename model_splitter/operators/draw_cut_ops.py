@@ -83,7 +83,7 @@ class MODEL_SPLITTER_OT_draw_cut_line(bpy.types.Operator):
         self.points_local = []
         self.segment_paths_local = []
         self.src_bvh_local = None
-        if self.mode == 'MANUAL' and self.source_obj and self.source_obj.data:
+        if self.mode in {'MANUAL', 'EXTRUDE_CURVE'} and self.source_obj and self.source_obj.data:
             try:
                 from mathutils.bvhtree import BVHTree
                 verts_l = [v.co.copy() for v in self.source_obj.data.vertices]
@@ -195,7 +195,7 @@ class MODEL_SPLITTER_OT_draw_cut_line(bpy.types.Operator):
         In MANUAL mode, dynamically re-projects the 3D surface-locked points so they
         rotate in real time when the user orbits the view or rotates the model.
         """
-        if self.mode != 'MANUAL':
+        if self.mode not in {'MANUAL', 'EXTRUDE_CURVE'}:
             return self.points_2d
 
         region = context.region
@@ -245,9 +245,9 @@ class MODEL_SPLITTER_OT_draw_cut_line(bpy.types.Operator):
                 self.rotate_view_turntable(context, delta.x, delta.y)
                 return {'RUNNING_MODAL'}
 
-            # Check hover over start point to close loop in Manual mode using live 3D->2D projection
+            # Check hover over start point to close loop in Manual / Extrude Curve mode using live 3D->2D projection
             active_2d = self.get_current_2d_points(context)
-            if len(active_2d) >= 3 and self.mode == 'MANUAL':
+            if len(active_2d) >= 3 and self.mode in {'MANUAL', 'EXTRUDE_CURVE'}:
                 dist = (self.mouse_pos - active_2d[0]).length
                 self.hover_close = (dist < 22.0)
             else:
@@ -259,8 +259,8 @@ class MODEL_SPLITTER_OT_draw_cut_line(bpy.types.Operator):
                     last_pt = self.points_2d[-1]
                     if (self.mouse_pos - last_pt).length > 6.0:
                         self.points_2d.append(self.mouse_pos.copy())
-            elif self.is_dragging and self.mode == 'MANUAL' and event.shift:
-                # Shift+Drag in Manual mode paints surface points continuously along the mesh
+            elif self.is_dragging and self.mode in {'MANUAL', 'EXTRUDE_CURVE'} and event.shift:
+                # Shift+Drag in Manual / Extrude Curve mode paints surface points continuously along the mesh
                 hit_3d = self.raycast_surface_point(context, self.mouse_pos.x, self.mouse_pos.y)
                 if hit_3d is not None:
                     pt_local = self.source_obj.matrix_world.inverted() @ hit_3d
@@ -283,13 +283,13 @@ class MODEL_SPLITTER_OT_draw_cut_line(bpy.types.Operator):
                 if self.hover_close:
                     return self.confirm_cut(context)
 
-                if self.mode == 'MANUAL':
+                if self.mode in {'MANUAL', 'EXTRUDE_CURVE'}:
                     hit_3d = self.raycast_surface_point(context, curr_pos.x, curr_pos.y)
                     if hit_3d is not None:
                         self._add_manual_point(hit_3d, curr_pos)
                         self.is_dragging = True
                     else:
-                        # Clicking & dragging on empty space in Manual mode orbits around the model!
+                        # Clicking & dragging on empty space in Manual / Extrude Curve mode orbits around the model!
                         self.is_rotating_model = True
                         self.rot_prev_mouse = curr_pos.copy()
 
@@ -377,7 +377,11 @@ class MODEL_SPLITTER_OT_draw_cut_line(bpy.types.Operator):
         """Constructs cutter volume from drawn points and triggers Draft or Easy cut."""
         self.cleanup_gpu(context)
 
-        if self.mode == 'MANUAL':
+        if self.mode == 'EXTRUDE_CURVE':
+            if len(self.points_local) < 3 and len(self.points_2d) < 3:
+                self.report({'WARNING'}, "Place at least 3 points on the mesh surface to form a closed curve for extrusion.")
+                return {'CANCELLED'}
+        elif self.mode == 'MANUAL':
             if len(self.points_local) < 2 and len(self.points_2d) < 2:
                 self.report({'WARNING'}, "Place at least 2 points on the mesh surface to form a cut.")
                 return {'CANCELLED'}
@@ -420,6 +424,18 @@ class MODEL_SPLITTER_OT_draw_cut_line(bpy.types.Operator):
                 cutter_obj, _, _, _ = cutter_geometry.create_cutter_from_surface_points(
                     context, self.source_obj, pts_3d
                 )
+        elif self.mode == 'EXTRUDE_CURVE':
+            mat_w = self.source_obj.matrix_world
+            pts_3d = [mat_w @ pt_l for pt_l in self.points_local]
+            view_normal = rv3d.view_rotation @ Vector((0, 0, -1)) if rv3d else Vector((0, -1, 0))
+            cutter_obj, _, _, _ = cutter_geometry.create_extruded_curve_cutter_from_points(
+                context,
+                self.source_obj,
+                pts_3d,
+                extrude_depth_mm=settings.cut.extrude_depth_mm,
+                view_normal=view_normal,
+                smoothness=settings.cut.curve_smoothness,
+            )
 
         if not cutter_obj:
             self.report({'ERROR'}, "Failed to generate cutter geometry from drawn line.")
@@ -468,11 +484,12 @@ class MODEL_SPLITTER_OT_draw_cut_line(bpy.types.Operator):
             'STRAIGHT': "Straight (Click & Drag or Click 2 Points)",
             'CURVED': "Curved (Drag arc or Click points + Enter)",
             'MANUAL': "Manual Surface (Click on mesh | Drag empty space / MMB / R to Rotate)",
+            'EXTRUDE_CURVE': "Curve Detail Extrude (Click curve around detail + Enter to Boolean)",
         }
         mode_text = mode_names.get(self.mode, self.mode)
 
         hud_title = f"ModelSplitter | DRAW CUT LINE  [{mode_text}]"
-        if self.mode == 'MANUAL':
+        if self.mode in {'MANUAL', 'EXTRUDE_CURVE'}:
             hud_help = "LMB on Mesh: Add Point  |  LMB Empty/MMB/R/Arrows: Rotate View  |  Ctrl+Z: Undo  |  Enter/Click Start: Confirm"
         else:
             hud_help = "LMB: Draw/Add Point  |  MMB/R/Arrows: Orbit View  |  Ctrl+Z: Undo  |  Enter: Confirm Cut  |  Esc: Cancel"
@@ -514,8 +531,10 @@ class MODEL_SPLITTER_OT_draw_cut_line(bpy.types.Operator):
                     preview_pts.append(self.mouse_pos)
                 smooth_pts = resample_smooth_curve_2d(preview_pts, num_samples=max(32, num_s * 2))
                 line_coords = [(p.x, p.y) for p in smooth_pts]
-            elif self.mode == 'MANUAL':
-                line_coords = self.get_manual_path_2d(context, include_close=self.hover_close)
+            elif self.mode in {'MANUAL', 'EXTRUDE_CURVE'}:
+                line_coords = self.get_manual_path_2d(
+                    context, include_close=(self.hover_close or self.mode == 'EXTRUDE_CURVE')
+                )
                 if len(line_coords) < 2:
                     line_coords = [(p.x, p.y) for p in active_pts]
             else:
