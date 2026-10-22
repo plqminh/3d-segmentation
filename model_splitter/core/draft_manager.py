@@ -182,6 +182,47 @@ def update_draft_connectors(context, force_auto=False):
         socket.matrix_basis = Matrix.Identity(4)
 
 
+def rebuild_extruded_cutter(context):
+    """
+    Rebuilds the active curve-detail cutter in Draft Mode from its stored control points using the
+    current Curve Smoothness and Extrude Depth, then refreshes the connector previews.
+    """
+    from .cutter_geometry import create_extruded_curve_cutter_from_points
+    settings = context.scene.model_splitter
+    cut_props = settings.cut
+    if not cut_props.is_in_draft:
+        return
+
+    old_cutter = bpy.data.objects.get(cut_props.active_cutter_name)
+    source_obj = bpy.data.objects.get(cut_props.active_source_name)
+    draft_col = bpy.data.collections.get(DRAFT_COLLECTION_NAME)
+    if not old_cutter or not source_obj or not draft_col or not old_cutter.get("ms_is_extruded_detail", False):
+        return
+
+    flat = list(old_cutter.get("ms_detail_points", []))
+    pts = [Vector((flat[i], flat[i + 1], flat[i + 2])) for i in range(0, len(flat) - 2, 3)]
+    if len(pts) < 3:
+        return
+
+    for obj in list(draft_col.objects):
+        bpy.data.objects.remove(obj, do_unlink=True)
+
+    new_cutter, _, _, _ = create_extruded_curve_cutter_from_points(
+        context,
+        source_obj,
+        pts,
+        extrude_depth_mm=cut_props.extrude_depth_mm,
+        target_collection=draft_col,
+        smoothness=cut_props.curve_smoothness,
+    )
+    cut_props.active_cutter_name = new_cutter.name
+    update_draft_connectors(context)
+
+    bpy.ops.object.select_all(action='DESELECT')
+    new_cutter.select_set(True)
+    context.view_layer.objects.active = new_cutter
+
+
 def update_draft_extrude_depth(context):
     """
     Dynamically updates the extrusion depth of an active `MS_Curve_Detail_Cutter` in Draft Mode

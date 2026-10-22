@@ -1520,6 +1520,7 @@ def create_extruded_curve_cutter_from_points(
     cutter_obj.show_in_front = True
     cutter_obj["ms_is_extruded_detail"] = True
     cutter_obj["ms_extrude_depth_scene"] = float(depth_scene)
+    cutter_obj["ms_detail_points"] = [c for p in points_3d for c in (p.x, p.y, p.z)]
     col.objects.link(cutter_obj)
 
     _attach_visual_surface(
@@ -1533,15 +1534,36 @@ def create_extruded_curve_cutter_from_points(
     return cutter_obj, floor_center, out_normal, world_mat
 
 
-def extract_points_from_curve_object(context, curve_obj, source_obj=None):
+def extract_points_from_curve_object(context, curve_obj, source_obj=None, control_points_only=True):
     """
     Samples a Blender CURVE object (Bezier, NURBS, or Poly, including Shrinkwrap or other modifiers)
     into an ordered list of 3D world-space loop points.
+    With control_points_only=True the spline's control points are used (so the Curve Smoothness
+    slider fully decides the outline shape); otherwise the evaluated dense curve is sampled.
     """
     if not curve_obj or curve_obj.type != 'CURVE' or not curve_obj.data:
         return []
 
     curve_data = curve_obj.data
+    if control_points_only and curve_data.splines:
+        mat_w = curve_obj.matrix_world
+        spline = curve_data.splines[0]
+        if spline.type == 'BEZIER':
+            ctrl = [mat_w @ bp.co for bp in spline.bezier_points]
+        else:
+            ctrl = [mat_w @ Vector((p.co.x, p.co.y, p.co.z)) for p in spline.points]
+        if len(ctrl) >= 3:
+            if source_obj and source_obj.data:
+                try:
+                    src_mat = source_obj.matrix_world
+                    sv = [src_mat @ v.co for v in source_obj.data.vertices]
+                    sp = [tuple(p.vertices) for p in source_obj.data.polygons]
+                    bvh = BVHTree.FromPolygons(sv, sp)
+                    ctrl = [(bvh.find_nearest(p)[0] or p) for p in ctrl]
+                except Exception:
+                    pass
+            return ctrl
+
     orig_bevel = curve_data.bevel_depth
     orig_extrude = curve_data.extrude
     pts_3d = []

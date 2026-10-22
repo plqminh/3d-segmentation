@@ -70,6 +70,17 @@ def update_explode_preview(self, context):
                 pass
 
 
+def update_curve_smoothness(self, context):
+    """Rebuilds the active extruded curve cutter in Draft Mode with the new smoothness."""
+    settings = getattr(context.scene, "model_splitter", None)
+    if settings and settings.cut.is_in_draft:
+        try:
+            from .core.draft_manager import rebuild_extruded_cutter
+            rebuild_extruded_cutter(context)
+        except Exception:
+            pass
+
+
 class ConnectorProperties(bpy.types.PropertyGroup):
     shape: EnumProperty(
         name="Pin Shape",
@@ -275,6 +286,7 @@ class CutProperties(bpy.types.PropertyGroup):
         min=0.0,
         max=1.0,
         subtype='FACTOR',
+        update=update_curve_smoothness,
     )
 
     extrude_depth_mm: FloatProperty(

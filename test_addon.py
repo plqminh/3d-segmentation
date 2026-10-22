@@ -258,6 +258,31 @@ print(f"[TEST] Detail parts: {[o.name for o in detail_parts]}")
 assert len(detail_parts) >= 2, "Curve detail extrude should produce body + detail parts!"
 settings.cut.workflow_mode = 'DRAFT'
 
+
+# Live smoothness change in Draft Mode
+print("\n[TEST] Testing live curve smoothness in Draft Mode...")
+bpy.ops.mesh.primitive_uv_sphere_add(radius=1.0, location=(80.0, 0.0, 0.0), segments=48, ring_count=24)
+sm_sphere = bpy.context.active_object
+bpy.context.view_layer.objects.active = sm_sphere
+settings.cut.workflow_mode = 'DRAFT'
+settings.cut.curve_smoothness = 0.0
+sm_curve = create_editable_detail_curve(bpy.context, sm_sphere)
+bpy.ops.object.select_all(action='DESELECT')
+sm_curve.select_set(True)
+bpy.context.view_layer.objects.active = sm_curve
+bpy.ops.modelsplitter.extrude_curve_cut()
+cut0 = bpy.data.objects.get(settings.cut.active_cutter_name)
+n0 = len(cut0.data.vertices)
+v0 = [tuple(v.co) for v in cut0.data.vertices][:5]
+settings.cut.curve_smoothness = 1.0
+cut1 = bpy.data.objects.get(settings.cut.active_cutter_name)
+assert settings.cut.is_in_draft and cut1 is not None, "Draft lost after smoothness change!"
+v1 = [tuple(v.co) for v in cut1.data.vertices][:5]
+print(f"[TEST] cutter verts {n0} -> {len(cut1.data.vertices)}, changed={v0 != v1}")
+assert v0 != v1, "Smoothness change did not rebuild the cutter!"
+bpy.ops.modelsplitter.cancel_draft()
+settings.cut.curve_smoothness = 0.0
+settings.cut.workflow_mode = 'DRAFT'
 # 13. Test No Pins option
 print("\n[TEST] Testing No Pins option...")
 bpy.ops.mesh.primitive_cube_add(size=2.0, location=(60.0, 0.0, 0.0))
@@ -273,3 +298,6 @@ assert all(len(o.data.polygons) == 6 for o in np_objs) and len(np_objs) == 2, [(
 settings.connector.no_connectors = False
 
 print("\n>>> ALL TESTS PASSED SUCCESSFULLY! <<<")
+
+
+
