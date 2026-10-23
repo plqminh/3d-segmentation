@@ -1,38 +1,53 @@
 # ModelSplitter — Blender 4.2+ / 5.x Add-on
 
-A high-precision, non-destructive 3D model splitting and keying add-on for 3D printing (SLA/FDM), recreating the complete feature set of **CatPin**.
+A high-precision, non-destructive 3D model splitting, keying, and print preparation add-on for 3D printing (SLA/FDM), combining the interactive drawing workflows of **CatPin** with the complete prep and segmentation feature set of **TTMinimal Split**.
 
 ---
 
 ## 🌟 Key Features
 
-1. **Interactive Viewport Cut Line Drawing (CatPin Workflow)**:
-   - **Straight View Cut**: Angle your camera, click and drag across the model to slice cleanly along the line-of-sight.
-   - **Curved Arc Cut**: Draw a gestural curved stroke across the viewport; sweeps into an organic cutting ribbon to hide seam lines.
-   - **Manual Surface Contour**: Click points or paint directly onto the 3D mesh surface to carve around muscle groups, limb joints, or detached features.
-   - **Camera Orbit during Drawing**: Hold `MMB` to freely rotate around the model while placing contour points without exiting the drawing tool.
-   - **Real-time GPU Viewport HUD**: On-screen shortcuts banner, vivid red cutting line, yellow live rubber-band preview, and green closing anchor dot.
-   - **Interactive Shortcuts**: `Enter` to commit, `Backspace` / `Ctrl+Z` to undo point, `Esc` to cancel.
+### 1. Scale Master & Model Preparation
+- **Real-Time Millimeter Dials**: Displays width, depth, and height in millimeters directly converted from scene geometry.
+- **Uniform Proportional Scaling**: Set a target maximum dimension (e.g. `200mm`) to automatically scale the model proportionately.
+- **One-Click Positioning**:
+  - **Focus View (`Reset View`)**: Immediately frames and zooms the viewport camera onto your selected model.
+  - **To Origin**: Centers model geometry and places origin at world `(0, 0, 0)`.
+  - **Drop to Bed (Z=0)**: Drops the model so its lowest bounding-box contact point sits flush on the print surface.
+  - **Quick Rotate**: One-click 90° re-orientation buttons (**Stand Up**, **Lay Flat**, and **Turn 90°**).
+  - **Fuse Models (Boolean Union / Join)**: Merges multi-part imports (e.g. limbs, props, accessories) into a single watertight mesh.
 
-2. **Non-Destructive Draft Mode vs. Easy Mode**:
-   - **Draft Mode**: Real-time 3D preview of cutting planes and connector pins. Move, rotate, and resize before committing geometry.
-   - **Easy Mode**: Slices and creates connectors in a single click directly upon releasing the drawn cut line.
+### 2. Multi-Mode Cutting Tools
+- **Straight View Cut**: Angle your camera, click and drag across the model to slice cleanly along the line-of-sight.
+- **Curved Arc Cut**: Draw a gestural curved stroke across the viewport; sweeps into an organic cutting ribbon to hide seam lines.
+- **Plane Cut (3D Transform Gizmo)**: Spawns an interactive planar cutter with Blender's standard 3D gizmo for effortless positioning and slicing.
+- **Manual Surface Contour**: Click points directly onto the 3D mesh surface to carve around muscle groups and limb joints.
+- **Interactive Contour Curve Editing**: In Draft Mode, click **Edit Contour** to adjust control points or press `Ctrl+Click` to insert extra curve points before finalizing.
+- **Cutter Mesh Resolution**: Fine-tune the ribbon step resolution (`Cut Smoothness`) for silk-smooth curved seams.
 
-3. **Intelligent Alignment Connectors (Pins & Sockets)**:
-   - **Pin Shapes**: Cylindrical, Conical (Tapered), Rectangular, and Custom Rigid Profiles.
-   - **Multi-Connector Support**: 1 to 5 connectors per cut with symmetric geometric distribution.
-   - **Independent Clearance & Tolerance**: Millimeter dials (recommended: `0.1–0.2mm` for Resin SLA, `0.2–0.35mm` for FDM).
-   - **Swap Pin Side**: Instant one-click toggle (`Swap`) to flip male pin placement between Part A and Part B.
-   - **Double-Sided Pins**: Generates loose alignment dowels / keys.
-   - **Explode Preview**: Slider to visually separate cut pieces along the cut normal to inspect joint fit before final printing.
+### 3. Intelligent Alignment Connectors (Pins & Sockets)
+- **Connector Shapes**:
+  - **Cylindrical & Conical (Tapered)**: Standard friction-fit assembly pins.
+  - **Neodymium Magnet Slots**: Recessed cylindrical pockets for standard disc magnets (**3x1**, **3x2**, **5x2**, **6x3**, **8x3 mm**).
+  - **D-Pin (Anti-Rotation)**: Keyed flat-edge cylinder preventing rotational slippage on circular joints.
+  - **Ball Joint**: Articulated spherical male head and clearance socket.
+  - **Rectangular Keys & Custom Meshes**: For structural alignment.
+- **Auto-Fit Within Mesh (`Tự căn vừa khối`)**: Automatically bounds pin radius and depth inside the cross-section walls, preventing pins from punching through thin exterior geometry (such as necks or fingers).
+- **Independent Tolerances & Clearances**: SLA resin (`0.1–0.2mm`) and FDM (`0.2–0.35mm`).
+- **Swap Pin Side & Explode Preview**: One-click male pin flipping and live interactive joint inspection slider.
 
-4. **Mesh Health & Pre-flight Diagnostics**:
-   - Accelerated **BVH-tree** analysis to detect non-manifold geometry, boundary edge holes, degenerate zero-area faces, and self-intersecting triangles.
-   - One-click **"Show in Edit Mode"** to inspect defect loops.
-   - **"Auto-Heal"** tool to weld vertices and recalculate surface normals.
+### 4. Mesh Health, Watertight Remesh & Decimation
+- **BVH Diagnostics**: Detect non-manifold edges, boundary holes, zero-area faces, and self-intersections with one-click **Auto-Heal**.
+- **Watertight Voxel Remesh**: High-speed voxel remeshing with millimeter-based resolution to generate clean manifold topology.
+- **Decimate Mesh**: Ratio-based polycount reduction preserving sharp geometry while lightening heavy sculpts.
 
-5. **Batch Export**:
-   - One-click batch export of separated parts to **STL** or **OBJ** formats ready for slicing (PrusaSlicer, Bambu Studio, Chitubox, Lychee).
+### 5. 3D Print Bed View & Automated Packing
+- **Custom Print Bed Visualizer**: Toggle a 3D wireframe build plate and volume box (`Width x Depth x Height mm`) in the viewport.
+- **Pack on Print Bed**: Automated 2D collision-aware shelf-packing arranging all separated cut parts neatly across the print bed at `Z=0` with configurable margin spacing.
+- **Batch Export**: Export parts in a single click to **STL** or **OBJ** formats.
+
+### 6. Basic vs. Advanced Mode
+- **Basic Mode**: Streamlined, intuitive toolbar for rapid slicing and print packing.
+- **Advanced Mode**: Full engineering dials, tolerances, custom clearance gaps, and mesh decimation.
 
 ---
 
@@ -45,27 +60,17 @@ A high-precision, non-destructive 3D model splitting and keying add-on for 3D pr
 4. Enable the **ModelSplitter** extension.
 
 ### Option 2: Live Development Symlink
-You can link the addon folder directly into your Blender extensions folder:
+The add-on is already synced to:
 `%APPDATA%\Blender Foundation\Blender\5.1\extensions\user_default\model_splitter`
 
 ---
 
-## 📖 How to Use
+## 📖 Recommended Workflow
 
-1. Press `N` in the 3D Viewport to open the sidebar and click on the **ModelSplitter** tab.
-2. Select your 3D mesh in Object Mode.
-3. *(Recommended)* Under **Mesh Health Pre-flight**, click **Check Active Mesh** to verify that your model is closed and manifold.
-4. Select your **Workflow** (`Draft Mode` or `Easy Mode`).
-5. Choose your **Draw Cut Style**:
-   - `Straight`: For clean planar cuts across limbs or torso.
-   - `Curved`: For organic contours.
-   - `Manual Surface`: For surface-snapped boundaries around joints.
-6. Click **Draw Cut Line**:
-   - Drag or click points across the model.
-   - Use `MMB` to rotate the view if drawing around the back.
-   - Press `Enter` (or click the green start dot) to commit.
-7. In **Draft Mode**, the cutting plane and preview pins appear at the exact drawn location:
-   - Click **Swap Pin Side** if you want the pin on the opposite part.
-   - Use the **Explode Preview** slider to inspect the seam.
-   - Click **Apply Cut (Build)** to finalize.
-8. Under **Batch Export**, select your export folder and click **Export Selected Parts**.
+1. Select your model in Object Mode and open the **ModelSplitter** N-Panel.
+2. In **Scale Master**, click **Drop to Bed (Z=0)** and adjust **Target Size (mm)** if needed.
+3. Check mesh health under **Mesh Health & Remesh** (or run **Voxel Remesh** if the mesh has open holes).
+4. Choose your cutting style (**Straight Cut**, **Curved Cut**, **Plane Cut**, or **Draw Cut Line**).
+5. Choose your alignment connector shape (**Cylinder**, **Magnet Slot**, **D-Pin**, or **Ball Joint**).
+6. In **Draft Mode**, inspect the seam with **Explode Preview**, then click **Apply Cut (Build)**.
+7. Under **Print Bed & Batch Export**, click **View Print Bed**, click **Pack on Bed**, and hit **Export All Parts**.

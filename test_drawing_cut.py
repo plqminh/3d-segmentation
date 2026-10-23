@@ -214,7 +214,7 @@ assert surface_cutter.get("ms_is_thin_blade") is True, "Manual cutter should be 
 z_span_cutter = max(v.co.z for v in surface_cutter.data.vertices) - min(v.co.z for v in surface_cutter.data.vertices)
 assert z_span_cutter < 0.02, f"Manual cutter should be a flat wafer plane, not a cylinder! Got Z thickness {z_span_cutter}"
 vis_manual = [ch for ch in surface_cutter.children if "Cut_Plane_Visual" in ch.name][0]
-assert len(vis_manual.data.polygons) == 512, f"Expected 512 smooth radial faces, got {len(vis_manual.data.polygons)}"
+assert len(vis_manual.data.polygons) == 640, f"Expected 640 smooth radial faces, got {len(vis_manual.data.polygons)}"
 assert all(p.use_smooth for p in vis_manual.data.polygons), "Expected all visual cutting plane faces to be smooth-shaded!"
 print(f"[TEST-DRAW] Surface contour cutter created: {surface_cutter.name} (thin blade Z={z_span_cutter:.5f}, NO cylinder) with {len(vis_manual.data.polygons)} smooth faces")
 

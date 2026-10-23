@@ -283,6 +283,58 @@ assert v0 != v1, "Smoothness change did not rebuild the cutter!"
 bpy.ops.modelsplitter.cancel_draft()
 settings.cut.curve_smoothness = 0.0
 settings.cut.workflow_mode = 'DRAFT'
+# Plane expand / contract in Draft Mode
+print("\n[TEST] Testing plane expand/contract...")
+bpy.ops.mesh.primitive_cube_add(size=2.0, location=(100.0, 0.0, 0.0))
+ps_cube = bpy.context.active_object
+bpy.context.view_layer.objects.active = ps_cube
+settings.cut.workflow_mode = 'DRAFT'
+bpy.ops.modelsplitter.straight_cut()
+ps_cutter = bpy.data.objects.get(settings.cut.active_cutter_name)
+def _span(o):
+    return max(v.co.x for v in o.data.vertices) - min(v.co.x for v in o.data.vertices)
+vis = [c for c in ps_cutter.children if "Cut_Plane_Visual" in c.name][0]
+s0 = _span(vis)
+settings.cut.plane_scale = 0.5
+assert abs(_span(vis) - s0 * 0.5) < 1e-4, "Plane did not contract!"
+settings.cut.plane_scale = 2.0
+assert abs(_span(vis) - s0 * 2.0) < 1e-4, "Plane did not expand!"
+print(f"[TEST] Plane span {s0:.3f} -> x0.5 / x2.0 OK")
+bpy.ops.modelsplitter.cancel_draft()
+settings.cut.plane_scale = 1.0
+
+# Manual Surface cut: test adding/removing outer loops outside the manual curve
+print("\n[TEST] Testing manual cut outer loops...")
+bpy.ops.mesh.primitive_uv_sphere_add(radius=1.0, location=(120.0, 0.0, 0.0), segments=48, ring_count=24)
+m_sphere = bpy.context.active_object
+bpy.context.view_layer.objects.active = m_sphere
+import math
+from mathutils import Vector
+from model_splitter.core.cutter_geometry import create_cutter_from_surface_points
+r_ring = math.sqrt(1 - 0.8**2)
+m_pts = [Vector((math.cos(a)*r_ring, math.sin(a)*r_ring, 0.8)) for a in [i*2*math.pi/6 for i in range(6)]]
+m_cutter, _, _, _ = create_cutter_from_surface_points(bpy.context, m_sphere, m_pts)
+from model_splitter.core.draft_manager import enter_draft_mode, apply_draft_build
+enter_draft_mode(bpy.context, m_sphere, cut_type='MANUAL', existing_cutter=m_cutter)
+settings.cut.plane_scale = 0.0
+mc0 = bpy.data.objects[settings.cut.active_cutter_name]
+vis_m0 = [c for c in mc0.children if "Cut_Plane_Visual" in c.name][0]
+faces_0 = len(vis_m0.data.polygons)
+
+settings.cut.plane_scale = 1.0
+mc1 = bpy.data.objects[settings.cut.active_cutter_name]
+vis_m1 = [c for c in mc1.children if "Cut_Plane_Visual" in c.name][0]
+faces_1 = len(vis_m1.data.polygons)
+
+settings.cut.plane_scale = 2.0
+mc2 = bpy.data.objects[settings.cut.active_cutter_name]
+vis_m2 = [c for c in mc2.children if "Cut_Plane_Visual" in c.name][0]
+faces_2 = len(vis_m2.data.polygons)
+
+print(f"[TEST] Manual cut visual plane faces with outer loops: 0 loops={faces_0}, 2 loops={faces_1}, 4 loops={faces_2}")
+assert faces_0 < faces_1 < faces_2, f"Visual plane faces did not expand with loops: {faces_0}, {faces_1}, {faces_2}"
+bpy.ops.modelsplitter.cancel_draft()
+settings.cut.plane_scale = 1.0
 # 13. Test No Pins option
 print("\n[TEST] Testing No Pins option...")
 bpy.ops.mesh.primitive_cube_add(size=2.0, location=(60.0, 0.0, 0.0))
@@ -298,6 +350,7 @@ assert all(len(o.data.polygons) == 6 for o in np_objs) and len(np_objs) == 2, [(
 settings.connector.no_connectors = False
 
 print("\n>>> ALL TESTS PASSED SUCCESSFULLY! <<<")
+
 
 
 

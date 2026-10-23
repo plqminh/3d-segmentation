@@ -14,6 +14,26 @@ from bpy.props import (
 )
 
 
+
+def update_magnet_preset(self, context):
+    """Updates connector dimensions based on standard disc neodymium magnet sizes."""
+    if self.magnet_preset == '3x1':
+        self.diameter_mm = 3.0
+        self.length_mm = 1.0
+    elif self.magnet_preset == '3x2':
+        self.diameter_mm = 3.0
+        self.length_mm = 2.0
+    elif self.magnet_preset == '5x2':
+        self.diameter_mm = 5.0
+        self.length_mm = 2.0
+    elif self.magnet_preset == '6x3':
+        self.diameter_mm = 6.0
+        self.length_mm = 3.0
+    elif self.magnet_preset == '8x3':
+        self.diameter_mm = 8.0
+        self.length_mm = 3.0
+    update_draft_preview(self, context)
+
 def update_connector_preset(self, context):
     """Updates connector dimensions based on standard 3D printing presets."""
     if self.preset == 'SMALL':
@@ -81,6 +101,17 @@ def update_curve_smoothness(self, context):
             pass
 
 
+def update_plane_scale(self, context):
+    """Expands / contracts the active cutting plane in Draft Mode."""
+    settings = getattr(context.scene, "model_splitter", None)
+    if settings and settings.cut.is_in_draft:
+        try:
+            from .core.draft_manager import apply_plane_scale
+            apply_plane_scale(context)
+        except Exception:
+            pass
+
+
 class ConnectorProperties(bpy.types.PropertyGroup):
     shape: EnumProperty(
         name="Pin Shape",
@@ -89,9 +120,34 @@ class ConnectorProperties(bpy.types.PropertyGroup):
             ('CYLINDER', "Cylinder", "Round cylindrical alignment pin (standard)"),
             ('CONICAL', "Conical (Tapered)", "Tapered pin for easy insertion"),
             ('RECTANGULAR', "Rectangular", "Rectangular alignment key / slot to prevent rotation"),
+            ('D_PIN', "D-Pin (Anti-Rotation)", "D-shaped cylindrical pin with a flat edge to prevent rotation"),
+            ('MAGNET', "Magnet Slot", "Recessed cylindrical cavities for neodymium magnet discs"),
+            ('BALL_JOINT', "Ball Joint", "Ball and socket joint for posable parts or snap retention"),
             ('CUSTOM', "Custom Shape", "Custom rigid mesh used as connector profile"),
         ],
         default='CYLINDER',
+        update=update_draft_preview,
+    )
+
+    magnet_preset: EnumProperty(
+        name="Magnet Size",
+        description="Standard disc neodymium magnet presets (Diameter x Height)",
+        items=[
+            ('CUSTOM', "Custom", "Set custom diameter and depth"),
+            ('3x1', "3x1 mm", "Small disc: 3mm diameter x 1mm height"),
+            ('3x2', "3x2 mm", "3mm diameter x 2mm height"),
+            ('5x2', "5x2 mm", "Standard 5mm diameter x 2mm height"),
+            ('6x3', "6x3 mm", "6mm diameter x 3mm height"),
+            ('8x3', "8x3 mm", "Large disc: 8mm diameter x 3mm height"),
+        ],
+        default='5x2',
+        update=update_magnet_preset,
+    )
+
+    auto_fit_bounds: BoolProperty(
+        name="Auto-Fit Bounds",
+        description="Automatically clamps and bounds connector size to remain inside the solid mesh walls",
+        default=True,
         update=update_draft_preview,
     )
 
@@ -274,9 +330,20 @@ class CutProperties(bpy.types.PropertyGroup):
             ('STRAIGHT', "Straight", "Draw a straight knife cut across the viewport"),
             ('CURVED', "Curved", "Draw a smooth curved arc cut across the viewport"),
             ('MANUAL', "Manual Surface", "Click or paint points directly on the 3D model surface"),
+            ('PLANE', "Plane Cut", "Interactive 3D cutting plane with transform gizmo"),
             ('EXTRUDE_CURVE', "Curve Detail", "Draw a closed curve and extrude it to polygons to Boolean out a detail"),
         ],
         default='STRAIGHT',
+    )
+
+    plane_scale: FloatProperty(
+        name="Plane Size",
+        description="Expand or contract the cutting plane. For manual cuts, adds or removes loops outside your manual curve",
+        default=1.0,
+        min=0.0,
+        max=5.0,
+        precision=2,
+        update=update_plane_scale,
     )
 
     curve_smoothness: FloatProperty(
@@ -305,6 +372,22 @@ class CutProperties(bpy.types.PropertyGroup):
         default=16,
         min=4,
         max=64,
+    )
+
+    cut_resolution_mm: FloatProperty(
+        name="Cut Smoothness (mm)",
+        description="Step resolution for generated cutting ribbons and surfaces (smaller = finer mesh)",
+        default=0.5,
+        min=0.05,
+        max=5.0,
+        unit='NONE',
+        update=update_draft_preview,
+    )
+
+    is_editing_contour: BoolProperty(
+        name="Editing Contour",
+        description="True when currently in interactive contour curve editing mode",
+        default=False,
     )
 
     explode_distance_mm: FloatProperty(
@@ -367,14 +450,133 @@ class ExportProperties(bpy.types.PropertyGroup):
     )
 
 
+
+class ScaleMasterProperties(bpy.types.PropertyGroup):
+    dim_x_mm: FloatProperty(
+        name="Width (X mm)",
+        description="Model width in millimeters along X axis",
+        default=100.0,
+        min=0.1,
+        max=10000.0,
+        unit='NONE',
+    )
+    dim_y_mm: FloatProperty(
+        name="Depth (Y mm)",
+        description="Model depth in millimeters along Y axis",
+        default=100.0,
+        min=0.1,
+        max=10000.0,
+        unit='NONE',
+    )
+    dim_z_mm: FloatProperty(
+        name="Height (Z mm)",
+        description="Model height in millimeters along Z axis",
+        default=100.0,
+        min=0.1,
+        max=10000.0,
+        unit='NONE',
+    )
+    uniform_scale_lock: BoolProperty(
+        name="Uniform Scaling",
+        description="Maintain proportional aspect ratio when changing any dimension",
+        default=True,
+    )
+    target_max_dim_mm: FloatProperty(
+        name="Max Dimension (mm)",
+        description="Quick scale longest axis to this millimeter value",
+        default=150.0,
+        min=1.0,
+        max=10000.0,
+        unit='NONE',
+    )
+
+
+class MeshToolProperties(bpy.types.PropertyGroup):
+    remesh_voxel_size_mm: FloatProperty(
+        name="Voxel Size (mm)",
+        description="Voxel size in millimeters for watertight remeshing (e.g. 0.3mm to 1.0mm)",
+        default=0.5,
+        min=0.05,
+        max=10.0,
+        precision=3,
+        unit='NONE',
+    )
+    decimate_ratio: FloatProperty(
+        name="Decimate Ratio",
+        description="Ratio of faces to keep (0.5 = 50% face reduction)",
+        default=0.5,
+        min=0.01,
+        max=1.0,
+        subtype='FACTOR',
+    )
+    last_polycount: StringProperty(
+        name="Polycount",
+        default="",
+    )
+
+
+class PrintBedProperties(bpy.types.PropertyGroup):
+    show_bed: BoolProperty(
+        name="Show Print Bed",
+        description="Displays 3D build plate and volume wireframe in the viewport",
+        default=False,
+    )
+    bed_x_mm: FloatProperty(
+        name="Bed Width (X mm)",
+        description="Print bed width in millimeters",
+        default=220.0,
+        min=10.0,
+        max=2000.0,
+        unit='NONE',
+    )
+    bed_y_mm: FloatProperty(
+        name="Bed Depth (Y mm)",
+        description="Print bed depth in millimeters",
+        default=220.0,
+        min=10.0,
+        max=2000.0,
+        unit='NONE',
+    )
+    bed_z_mm: FloatProperty(
+        name="Bed Height (Z mm)",
+        description="Print volume height in millimeters",
+        default=250.0,
+        min=10.0,
+        max=2000.0,
+        unit='NONE',
+    )
+    part_spacing_mm: FloatProperty(
+        name="Part Margin (mm)",
+        description="Spacing between arranged parts on the build plate",
+        default=10.0,
+        min=1.0,
+        max=100.0,
+        unit='NONE',
+    )
+
 class ModelSplitterSettings(bpy.types.PropertyGroup):
+    ui_mode: EnumProperty(
+        name="UI Mode",
+        description="Switch between Basic and Advanced toolbars",
+        items=[
+            ('BASIC', "Basic", "Clean streamlined workflow for quick splitting and keying"),
+            ('ADVANCED', "Advanced", "Full engineering dials, tolerances, and diagnostics"),
+        ],
+        default='BASIC',
+    )
+    scale_master: PointerProperty(type=ScaleMasterProperties)
     cut: PointerProperty(type=CutProperties)
     connector: PointerProperty(type=ConnectorProperties)
     mesh_check: PointerProperty(type=MeshCheckProperties)
+    mesh_tools: PointerProperty(type=MeshToolProperties)
+    print_bed: PointerProperty(type=PrintBedProperties)
     export: PointerProperty(type=ExportProperties)
 
 
 classes = (
+    ScaleMasterProperties,
+    MeshToolProperties,
+    PrintBedProperties,
     ConnectorProperties,
     CutProperties,
     MeshCheckProperties,

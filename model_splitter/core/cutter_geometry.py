@@ -107,8 +107,9 @@ def _attach_visual_surface(cutter_obj, bm_surface, col, name="MS_Cut_Plane_Visua
     plane_obj.matrix_parent_inverse = Matrix.Identity(4)
     plane_obj.display_type = 'SOLID'
     plane_obj.color = color
-    plane_obj.show_wire = False
-    plane_obj.hide_select = True
+    plane_obj.show_wire = True
+    plane_obj.show_in_front = True
+    plane_obj.hide_select = False
     col.objects.link(plane_obj)
     return plane_obj
 
@@ -1012,7 +1013,7 @@ def create_cutter_from_screen_curve(context, source_obj, points_2d, region, rv3d
     return cutter_obj, curve_center, plane_normal, world_mat
 
 
-def create_cutter_from_surface_points(context, source_obj, points_3d, target_collection=None, view_normal=None):
+def create_cutter_from_surface_points(context, source_obj, points_3d, target_collection=None, view_normal=None, skirt_loops=2):
     """
     Creates a smooth, wafer-thin cutting plane tightly fitted just outside the 3D points
     placed on the model surface. Slices ONLY along the 2D cutting surface patch (no extruded cylinder).
@@ -1035,8 +1036,9 @@ def create_cutter_from_surface_points(context, source_obj, points_3d, target_col
         if p_norm.length < 1e-5:
             p_norm = Vector((0, 0, 1))
         mid = (points_3d[0] + points_3d[1]) * 0.5
-        width = seg_len * 1.2
-        depth = max(seg_len * 1.2, diag * 0.35)
+        loop_mult = max(0.2, 1.0 + 0.25 * (skirt_loops - 2))
+        width = seg_len * 1.2 * loop_mult
+        depth = max(seg_len * 1.2 * loop_mult, diag * 0.35 * loop_mult)
         half_t = max(seg_len * 0.002, diag * 0.0002, 1e-4)
         world_mat = build_orthonormal_cutter_matrix(mid, seg, p_norm)
 
@@ -1053,11 +1055,15 @@ def create_cutter_from_surface_points(context, source_obj, points_3d, target_col
         cutter_obj.show_in_front = True
         cutter_obj["ms_is_thin_blade"] = True
         cutter_obj["ms_blade_thickness"] = float(half_t * 2.0)
+        cutter_obj["ms_surface_points"] = [c for p in points_3d for c in (p.x, p.y, p.z)]
         col.objects.link(cutter_obj)
 
         bm_plane = create_visual_plane_mesh(width=width, depth=depth)
-        _attach_visual_surface(cutter_obj, bm_plane, col, name="MS_Cut_Plane_Visual", color=(0.1, 0.85, 0.35, 0.45))
-        mid, world_mat = recenter_cutter_to_mesh_intersection(cutter_obj, source_obj)
+        plane_obj = _attach_visual_surface(
+            cutter_obj, bm_plane, col, name="MS_Cut_Plane_Visual", color=(0.1, 0.85, 0.35, 0.45)
+        )
+        plane_obj.show_wire = True
+        plane_obj.show_in_front = True
         return cutter_obj, mid, p_norm, world_mat
 
     centroid = sum(points_3d, Vector()) / len(points_3d)
@@ -1147,9 +1153,10 @@ def create_cutter_from_surface_points(context, source_obj, points_3d, target_col
 
             best_exit = None
             best_exit_r = r_xy
+            max_allowed_dist = max(contour_radius * 0.25, diag * 0.03)
             for ray_orig, ray_dir_w, base_d in candidate_rays:
                 cur_t = 0.65 * base_d
-                max_t = max(base_d * 2.25, max_r_xy * 1.45)
+                max_t = min(base_d * 1.30, base_d + max_allowed_dist)
                 for _ in range(5):
                     if cur_t >= max_t:
                         break
@@ -1160,13 +1167,14 @@ def create_cutter_from_surface_points(context, source_obj, points_3d, target_col
                         break
                     hit_t = cur_t + hit_dist
                     if hit_t >= base_d * 0.96 and hit_norm.dot(ray_dir_w) > 0.04:
-                        hit_lp = world_mat_inv @ hit_loc
-                        hit_r = math.hypot(hit_lp.x, hit_lp.y)
-                        if hit_r > best_exit_r:
-                            best_exit_r = hit_r
-                            best_exit = hit_loc
+                        if (hit_loc - p_w).length <= max_allowed_dist:
+                            hit_lp = world_mat_inv @ hit_loc
+                            hit_r = math.hypot(hit_lp.x, hit_lp.y)
+                            if hit_r > best_exit_r:
+                                best_exit_r = hit_r
+                                best_exit = hit_loc
                     cur_t = hit_t + max(1e-4, base_d * 0.02)
-            if best_exit is not None:
+            if best_exit is not None and (best_exit - p_w).length <= max_allowed_dist:
                 seam_world[i] = best_exit
 
         # Lightly smooth the resulting outer seam loop so there are no sharp radial steps
@@ -1218,7 +1226,8 @@ def create_cutter_from_surface_points(context, source_obj, points_3d, target_col
     #    while keeping ring (inner_rings-1) at r = 1.0 fixed right on the 3D surface seam!
     seam_ring_co = rings_co[inner_rings - 1]
     prev_ring_co = rings_co[inner_rings - 2]
-    for r_skirt in (1.18, 1.36):
+    for k_skirt in range(1, max(0, int(skirt_loops)) + 1):
+        r_skirt = 1.0 + 0.18 * k_skirt
         skirt_ring = []
         ext_factor = (r_skirt - 1.0) * inner_rings
         for i in range(num_ring):
@@ -1257,9 +1266,8 @@ def create_cutter_from_surface_points(context, source_obj, points_3d, target_col
         t_ring = [bm.verts.new(co + dz_vec) for co in rings_co[r_idx]]
         bottom_rings.append(b_ring)
         top_rings.append(t_ring)
-        if r_idx < inner_rings:
-            v_ring = [bm_vis.verts.new(co) for co in rings_co[r_idx]]
-            vis_rings.append(v_ring)
+        v_ring = [bm_vis.verts.new(co) for co in rings_co[r_idx]]
+        vis_rings.append(v_ring)
 
     # Innermost fan faces around center (bottom, top, and visual surface)
     for i in range(num_ring):
@@ -1277,19 +1285,16 @@ def create_cutter_from_surface_points(context, source_obj, points_3d, target_col
         outer_b = bottom_rings[r_idx + 1]
         inner_t = top_rings[r_idx]
         outer_t = top_rings[r_idx + 1]
-        has_vis = (r_idx + 1) < len(vis_rings)
-        if has_vis:
-            inner_v = vis_rings[r_idx]
-            outer_v = vis_rings[r_idx + 1]
+        inner_v = vis_rings[r_idx]
+        outer_v = vis_rings[r_idx + 1]
         for i in range(num_ring):
             next_i = (i + 1) % num_ring
             f_bot = bm.faces.new([inner_b[i], inner_b[next_i], outer_b[next_i], outer_b[i]])
             f_bot.smooth = True
             f_top = bm.faces.new([inner_t[i], outer_t[i], outer_t[next_i], inner_t[next_i]])
             f_top.smooth = True
-            if has_vis:
-                f_vis = bm_vis.faces.new([inner_v[i], outer_v[i], outer_v[next_i], inner_v[next_i]])
-                f_vis.smooth = True
+            f_vis = bm_vis.faces.new([inner_v[i], outer_v[i], outer_v[next_i], inner_v[next_i]])
+            f_vis.smooth = True
 
 
     # Thin wafer outer rim (only 2 * half_t thick — no cylinder!)
@@ -1311,13 +1316,15 @@ def create_cutter_from_surface_points(context, source_obj, points_3d, target_col
     cutter_obj.show_in_front = True
     cutter_obj["ms_is_thin_blade"] = True
     cutter_obj["ms_blade_thickness"] = float(half_t * 2.0)
+    cutter_obj["ms_surface_points"] = [c for p in points_3d for c in (p.x, p.y, p.z)]
     col.objects.link(cutter_obj)
 
-    _attach_visual_surface(
+    plane_obj = _attach_visual_surface(
         cutter_obj, bm_vis, col, name="MS_Cut_Plane_Visual", color=(0.1, 0.85, 0.35, 0.45)
     )
+    plane_obj.show_wire = True
+    plane_obj.show_in_front = True
 
-    centroid, world_mat = recenter_cutter_to_mesh_intersection(cutter_obj, source_obj)
     return cutter_obj, centroid, avg_normal, world_mat
 
 

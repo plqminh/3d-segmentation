@@ -109,6 +109,88 @@ def build_rectangular_mesh(width, depth, length, anchor_depth=0.0, double_sided=
     return bm
 
 
+
+def build_d_pin_mesh(radius, length, anchor_depth=0.0, flat_ratio=0.35, segments=32, double_sided=False):
+    """
+    Creates a D-shaped pin with a planar flat chord to physically prevent rotation.
+    """
+    bm = bmesh.new()
+    flat_x = radius * (1.0 - flat_ratio)
+    z_bottom = -length if double_sided else -anchor_depth
+    z_base = 0.0
+    z_top = length
+    has_bottom_ring = double_sided or (anchor_depth > 0.0)
+
+    bottom_verts = []
+    base_verts = []
+    top_verts = []
+
+    for i in range(segments):
+        theta = i * (2.0 * math.pi / segments)
+        px = math.cos(theta) * radius
+        py = math.sin(theta) * radius
+        if px > flat_x:
+            px = flat_x
+        if has_bottom_ring:
+            bottom_verts.append(bm.verts.new(Vector((px, py, z_bottom))))
+        base_verts.append(bm.verts.new(Vector((px, py, z_base))))
+        top_verts.append(bm.verts.new(Vector((px, py, z_top))))
+
+    if has_bottom_ring:
+        for i in range(segments):
+            next_i = (i + 1) % segments
+            bm.faces.new([bottom_verts[i], bottom_verts[next_i], base_verts[next_i], base_verts[i]])
+        bm.faces.new(list(reversed(bottom_verts)))
+    else:
+        bm.faces.new(list(reversed(base_verts)))
+
+    for i in range(segments):
+        next_i = (i + 1) % segments
+        bm.faces.new([base_verts[i], base_verts[next_i], top_verts[next_i], top_verts[i]])
+
+    bm.faces.new(top_verts)
+    bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
+    return bm
+
+
+def build_ball_joint_mesh(radius, length, anchor_depth=0.0, clearance=0.0, is_socket=False):
+    """
+    Creates a ball joint male pin (neck + sphere head) or dilated female socket cavity.
+    """
+    bm = bmesh.new()
+    r_sphere = radius + clearance
+    neck_r = (radius * 0.55) + clearance
+    z_bottom = -(anchor_depth + clearance)
+
+    sphere_center = Vector((0.0, 0.0, max(length * 0.6, radius * 1.1)))
+    bmesh.ops.create_uvsphere(
+        bm,
+        u_segments=16,
+        v_segments=16,
+        radius=r_sphere,
+    )
+    for v in bm.verts:
+        v.co += sphere_center
+
+    neck_top_z = sphere_center.z - (r_sphere * 0.6)
+    segments = 16
+    bot_ring = []
+    top_ring = []
+    for i in range(segments):
+        th = i * (2.0 * math.pi / segments)
+        bx = math.cos(th) * neck_r
+        by = math.sin(th) * neck_r
+        bot_ring.append(bm.verts.new(Vector((bx, by, z_bottom))))
+        top_ring.append(bm.verts.new(Vector((bx, by, neck_top_z))))
+
+    for i in range(segments):
+        ni = (i + 1) % segments
+        bm.faces.new([bot_ring[i], bot_ring[ni], top_ring[ni], top_ring[i]])
+    bm.faces.new(list(reversed(bot_ring)))
+
+    bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
+    return bm
+
 def build_custom_connector_mesh(custom_obj, radius, length, anchor_depth=0.0, clearance=0.0, double_sided=False):
     """
     Normalizes a user-supplied custom mesh to the target connector diameter, length,
@@ -183,6 +265,19 @@ def create_single_connector_pair(
         bm_pin = build_cylinder_mesh(
             radius, length, anchor_depth=anchor_depth, taper_ratio=taper_ratio, double_sided=double_sided
         )
+    elif shape == 'D_PIN':
+        bm_pin = build_d_pin_mesh(
+            radius, length, anchor_depth=anchor_depth, double_sided=double_sided
+        )
+    elif shape == 'MAGNET':
+        # Magnet pin is a disc marker in the cavity
+        bm_pin = build_cylinder_mesh(
+            radius, length, anchor_depth=anchor_depth, double_sided=True
+        )
+    elif shape == 'BALL_JOINT':
+        bm_pin = build_ball_joint_mesh(
+            radius, length, anchor_depth=anchor_depth, clearance=0.0, is_socket=False
+        )
     elif shape == 'RECTANGULAR':
         bm_pin = build_rectangular_mesh(
             radius * 2, radius * 1.4, length, anchor_depth=anchor_depth, double_sided=double_sided
@@ -210,6 +305,19 @@ def create_single_connector_pair(
     if shape in ('CYLINDER', 'CONICAL'):
         bm_socket = build_cylinder_mesh(
             s_radius, s_length, anchor_depth=s_anchor, taper_ratio=taper_ratio, double_sided=double_sided
+        )
+    elif shape == 'D_PIN':
+        bm_socket = build_d_pin_mesh(
+            s_radius, s_length, anchor_depth=s_anchor, double_sided=double_sided
+        )
+    elif shape == 'MAGNET':
+        # Magnet socket carves recessed cavities into both split parts so disc magnets can be inserted
+        bm_socket = build_cylinder_mesh(
+            s_radius, s_length, anchor_depth=s_length, double_sided=True
+        )
+    elif shape == 'BALL_JOINT':
+        bm_socket = build_ball_joint_mesh(
+            radius, length, anchor_depth=s_anchor, clearance=clearance, is_socket=True
         )
     elif shape == 'RECTANGULAR':
         bm_socket = build_rectangular_mesh(
@@ -405,7 +513,7 @@ def generate_cut_connectors(
         placements = auto_placements
 
     # If the cut is across a narrow appendage (e.g. ear or finger), clamp pin size so it fits inside the cross-section wall
-    if max_wall > 1e-5 and not manual_xy_offsets:
+    if max_wall > 1e-5 and getattr(con_props, "auto_fit_bounds", True) and not manual_xy_offsets:
         max_safe_r = max_wall * (0.48 if count == 1 else 0.35)
         max_safe_l = max_wall * 1.35
         if radius > max_safe_r or length > max_safe_l:

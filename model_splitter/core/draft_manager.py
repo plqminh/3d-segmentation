@@ -5,7 +5,7 @@ the cutting plane and connectors before baking final geometry.
 """
 
 import bpy
-from mathutils import Vector
+from mathutils import Vector, Matrix
 from ..utils.mesh_utils import (
     get_or_create_collection,
     remove_collection_and_objects,
@@ -39,6 +39,10 @@ def enter_draft_mode(context, source_obj, cut_type='STRAIGHT', existing_cutter=N
     """
     settings = context.scene.model_splitter
     cut_props = settings.cut
+
+    # Reset plane expand/contract factor for the new cut (draft flag is still False, so no callback work)
+    if cut_props.plane_scale != 1.0:
+        cut_props.plane_scale = 1.0
 
     # Ensure transforms are applied for accurate booleans
     apply_object_transforms(source_obj, location=False, rotation=True, scale=True)
@@ -105,6 +109,61 @@ def _extract_draft_pin_xy_offsets(draft_col, cutter_mat_inv):
     return offsets
 
 
+
+def sync_draft_cutter_transforms(cutter_obj):
+    """
+    If the user directly transformed the visual cutting plane helper in the viewport,
+    propagates the world transformation to the parent boolean cutter volume.
+    """
+    if not cutter_obj:
+        return
+    from .cutter_geometry import get_cutter_visual_surface_obj
+    vis_obj = get_cutter_visual_surface_obj(cutter_obj)
+    if vis_obj:
+        loc_offset = vis_obj.location.length
+        rot_offset = abs(vis_obj.rotation_euler.x) + abs(vis_obj.rotation_euler.y) + abs(vis_obj.rotation_euler.z)
+        scale_offset = abs(vis_obj.scale.x - 1.0) + abs(vis_obj.scale.y - 1.0) + abs(vis_obj.scale.z - 1.0)
+        if loc_offset > 1e-5 or rot_offset > 1e-4 or scale_offset > 1e-4:
+            cutter_obj.matrix_world = vis_obj.matrix_world.copy()
+            vis_obj.location = Vector((0.0, 0.0, 0.0))
+            vis_obj.rotation_euler = (0.0, 0.0, 0.0)
+            vis_obj.scale = Vector((1.0, 1.0, 1.0))
+            try:
+                bpy.context.view_layer.update()
+            except Exception:
+                pass
+
+
+def rebuild_cutter_from_visual_surface(cutter_obj):
+    """
+    Rebuilds cutter_obj boolean volume mesh from the user-edited visual surface mesh
+    by solidifying the sheet into a closed, watertight manifold blade.
+    """
+    if not cutter_obj or not cutter_obj.data:
+        return False
+    import bmesh
+    from .cutter_geometry import get_cutter_visual_surface_obj
+    vis_obj = get_cutter_visual_surface_obj(cutter_obj)
+    if not vis_obj or not vis_obj.data or not vis_obj.data.polygons:
+        return False
+
+    blade_t = float(cutter_obj.get("ms_blade_thickness", 1e-3))
+
+    bm_cut = bmesh.new()
+    bm_cut.from_mesh(vis_obj.data)
+    bmesh.ops.recalc_face_normals(bm_cut, faces=bm_cut.faces)
+    try:
+        bmesh.ops.solidify(bm_cut, geom=bm_cut.faces, thickness=blade_t)
+        bmesh.ops.recalc_face_normals(bm_cut, faces=bm_cut.faces)
+        bm_cut.to_mesh(cutter_obj.data)
+        cutter_obj.data.update()
+        return True
+    except Exception as e:
+        print("rebuild_cutter_from_visual_surface error:", e)
+        return False
+    finally:
+        bm_cut.free()
+
 def update_draft_connectors(context, force_auto=False):
     """
     Regenerates connector preview objects in the draft collection to reflect
@@ -125,6 +184,8 @@ def update_draft_connectors(context, force_auto=False):
 
     if not cutter_obj or not source_obj or not draft_col:
         return
+
+    sync_draft_cutter_transforms(cutter_obj)
 
     try:
         context.view_layer.update()
@@ -182,6 +243,95 @@ def update_draft_connectors(context, force_auto=False):
         socket.matrix_basis = Matrix.Identity(4)
 
 
+def _rebuild_manual_cutter_scaled(context, old_cutter, source_obj, draft_col, target):
+    """
+    Expands / contracts a Manual Surface cut by adding or removing loops outside the
+    cutting plane following the user's manual curve.
+    The manual curve itself remains strictly unchanged.
+    """
+    from .cutter_geometry import create_cutter_from_surface_points
+
+    flat = list(old_cutter.get("ms_surface_points", []))
+    pts = [Vector((flat[i], flat[i + 1], flat[i + 2])) for i in range(0, len(flat) - 2, 3)]
+    if len(pts) < 3:
+        return False
+
+    # The manual curve points `pts` NEVER change!
+    # `target` (plane_scale) directly controls the number of outer skirt loops:
+    # 0.0 -> 0 loops (cut plane stops exactly on the drawn manual curve)
+    # 0.5 -> 1 loop outside
+    # 1.0 -> 2 loops outside (default)
+    # 1.5 -> 3 loops outside
+    # 2.0 -> 4 loops outside
+    # 3.0 -> 6 loops outside
+    # 5.0 -> 10 loops outside
+    skirt_loops = max(0, int(round(target * 2.0)))
+
+    for obj in list(draft_col.objects):
+        bpy.data.objects.remove(obj, do_unlink=True)
+
+    new_cutter, _, _, _ = create_cutter_from_surface_points(
+        context, source_obj, pts, target_collection=draft_col, skirt_loops=skirt_loops
+    )
+    # Keep ORIGINAL points and current scale factor
+    new_cutter["ms_surface_points"] = flat
+    new_cutter["ms_plane_scale"] = target
+    new_cutter["ms_skirt_loops"] = skirt_loops
+    context.scene.model_splitter.cut.active_cutter_name = new_cutter.name
+    update_draft_connectors(context)
+
+    bpy.ops.object.select_all(action='DESELECT')
+    new_cutter.select_set(True)
+    context.view_layer.objects.active = new_cutter
+    return True
+
+
+def apply_plane_scale(context):
+    """
+    Expands or contracts the active cutting plane (and its visuals) in its own local XY plane
+    to match `cut_props.plane_scale`. Vertices are scaled around the cutter origin so the
+    cutting surface keeps its position, orientation and thickness.
+    Manual Surface cuts instead offset their drawn contour along the mesh skin.
+    """
+    settings = context.scene.model_splitter
+    cut_props = settings.cut
+    if not cut_props.is_in_draft:
+        return
+
+    cutter_obj = bpy.data.objects.get(cut_props.active_cutter_name)
+    if not cutter_obj or not cutter_obj.data:
+        return
+
+    current = float(cutter_obj.get("ms_plane_scale", 1.0))
+    target = max(0.05, float(cut_props.plane_scale))
+    factor = target / max(current, 1e-6)
+    if abs(factor - 1.0) < 1e-6:
+        return
+
+    source_obj = bpy.data.objects.get(cut_props.active_source_name)
+    draft_col = bpy.data.collections.get(DRAFT_COLLECTION_NAME)
+    if (
+        cutter_obj.get("ms_is_thin_blade", False)
+        and cutter_obj.get("ms_surface_points")
+        and source_obj
+        and draft_col
+    ):
+        if _rebuild_manual_cutter_scaled(context, cutter_obj, source_obj, draft_col, target):
+            return
+
+    meshes = [cutter_obj] + [c for c in cutter_obj.children if c.type == 'MESH']
+    for obj in meshes:
+        if not obj.data:
+            continue
+        for v in obj.data.vertices:
+            v.co.x *= factor
+            v.co.y *= factor
+        obj.data.update()
+
+    cutter_obj["ms_plane_scale"] = target
+    update_draft_connectors(context)
+
+
 def rebuild_extruded_cutter(context):
     """
     Rebuilds the active curve-detail cutter in Draft Mode from its stored control points using the
@@ -216,6 +366,7 @@ def rebuild_extruded_cutter(context):
         smoothness=cut_props.curve_smoothness,
     )
     cut_props.active_cutter_name = new_cutter.name
+    apply_plane_scale(context)
     update_draft_connectors(context)
 
     bpy.ops.object.select_all(action='DESELECT')
@@ -280,6 +431,15 @@ def apply_draft_build(context):
     if not source_obj or not cutter_obj:
         cancel_draft_mode(context)
         return []
+
+    if context.mode != 'OBJECT':
+        try:
+            bpy.ops.object.mode_set(mode='OBJECT')
+        except Exception:
+            pass
+
+    sync_draft_cutter_transforms(cutter_obj)
+    rebuild_cutter_from_visual_surface(cutter_obj)
 
     try:
         context.view_layer.update()
